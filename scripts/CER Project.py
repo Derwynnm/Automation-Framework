@@ -1,8 +1,9 @@
 import pandas as pd
+from pathlib import Path
 
 # === CONFIGURATION ===
-input_file = r'C:\Users\dmckella\Desktop\Phones.xlsx'
-output_file = r'C:\Users\dmckella\Desktop\Results.xlsx'
+input_file = Path(__file__).resolve().parents[1] / "database" / "Phones.xlsx"
+output_file = Path(__file__).resolve().parents[1] / "docs" / "Results.xlsx"
 sheet_name = None
 
 # === SCRIPT ===

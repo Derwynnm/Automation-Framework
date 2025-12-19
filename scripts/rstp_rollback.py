@@ -14,7 +14,8 @@ secret = os.getenv("secret")
 
 
 # Load Excel file with IPs and VLANs
-df = pd.read_excel(r'C:\Users\dmckella\Desktop\Automation\RSTP Project\AIK.xlsx')  # Same file you used before
+INPUT_FILE = Path(__file__).resolve().parents[1] / "database" / "AIK.xlsx"  # Same file you used before
+df = pd.read_excel(INPUT_FILE)
 
 for index, row in df.iterrows():
     ip = str(row.get('IP Address')).strip()

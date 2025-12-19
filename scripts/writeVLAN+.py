@@ -15,7 +15,7 @@ from netmiko import (
 )
 
 # ───────────────── USER CONFIGURABLE ─────────────────────────────────────────
-EXCEL_FILE = Path(r"C:\Users\dmckella\Desktop\Automation\District.xlsx")
+EXCEL_FILE = Path(__file__).resolve().parents[1] / "database" / "District.xlsx"
 MAX_THREADS = 200      # upper bound for concurrent SSH sessions
 RETRIES = 3           # per‑device connect retries
 BACKOFF_SEC = 2       # initial back‑off; doubles each retry
@@ -99,7 +99,7 @@ def main() -> None:
     for idx, vlans in results.items():
         df.at[idx, "VLANs"] = vlans
 
-    out_file = EXCEL_FILE.with_stem(EXCEL_FILE.stem + "_updated")
+    out_file = Path(__file__).resolve().parents[1] / "docs" / f"{EXCEL_FILE.stem}_updated{EXCEL_FILE.suffix}"
     df.to_excel(out_file, index=False)
     print(f"\nVLAN data written to {out_file}")
 

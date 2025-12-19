@@ -17,7 +17,7 @@ from netmiko import (
 )
 
 # ─────────── USER CONFIGURABLE ────────────────────────────────────────────────
-EXCEL_FILE = Path(r"C:\Users\dmckella\Desktop\Automation\RSTP Project\High.xlsx")
+EXCEL_FILE = Path(__file__).resolve().parents[1] / "database" / "High.xlsx"
 LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "rstp_log.txt"
 MAX_GLOBAL_THREADS = 200        # never exceed this many simultaneous sessions
 MAX_PER_SITE_THREADS = 10       # limit per derived site label
@@ -181,7 +181,7 @@ def main() -> None:
 
     # write CSV summary
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = Path(f"summary_{ts}.csv")
+    csv_path = Path(__file__).resolve().parents[1] / "docs" / f"summary_{ts}.csv"
     with csv_path.open("w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(["IP", "Site", "Status"])

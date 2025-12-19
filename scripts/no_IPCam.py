@@ -19,7 +19,7 @@ secret = os.getenv("secret")
 # Configuration
 
 THREADS = 10  # Adjust this to tune parallelism
-FILE_PATH = r"C:\Users\dmckella\Desktop\Automation\IPCam.xlsx"  # Excel input
+FILE_PATH = Path(__file__).resolve().parents[1] / "database" / "IPCam.xlsx"  # Excel input
 SSH_TIMEOUT = 60  # Seconds before an SSH attempt times out
 LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "ipcam_log.txt"  # Log file name
 

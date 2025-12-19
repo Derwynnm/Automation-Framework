@@ -18,7 +18,7 @@ password = os.getenv("password")
 secret = os.getenv("secret")
 
 # ---------------- Config ----------------
-EXCEL_PATH = r'C:\Users\dmckella\Desktop\Automation\MACTest.xlsx'
+EXCEL_PATH = Path(__file__).resolve().parents[1] / "database" / "MACTest.xlsx"
 TARGET_VLAN = 1          # global target VLAN; can be per-row if you add a column
 DRY_RUN = True
 LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "deploy_vlan_changes.log"

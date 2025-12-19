@@ -14,7 +14,8 @@ password = os.getenv("password")
 secret = os.getenv("secret")
 
 # Load MACs and IPs from Excel
-mac_df = pd.read_excel(r'C:\Users\dmckella\Desktop\Automation\RSTP Project\Sandbox\SBMAC.xlsx')  # Excel sheet with IP and MAC columns
+INPUT_FILE = Path(__file__).resolve().parents[1] / "database" / "SBMAC.xlsx"
+mac_df = pd.read_excel(INPUT_FILE)  # Excel sheet with IP and MAC columns
 mac_df['MAC Address'] = mac_df['MAC Address'].str.lower()
 
 # Sanitize MAC Column

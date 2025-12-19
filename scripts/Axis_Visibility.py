@@ -20,8 +20,8 @@ secret =   os.getenv("secret")
 
 
 # ── USER VARIABLES ──────────────────────────────────────────────────────────────
-INPUT_FILE  = r"C:\Users\dmckella\Desktop\WriteMem.xlsx"
-OUTPUT_FILE = r"C:\Users\dmckella\Desktop\Automation\LLDP_Audit_Result.xlsx"
+INPUT_FILE  = Path(__file__).resolve().parents[1] / "database" / "WriteMem.xlsx"
+OUTPUT_FILE = Path(__file__).resolve().parents[1] / "docs" / "LLDP_Audit_Result.xlsx"
 MAX_WORKERS = 100
 # ────────────────────────────────────────────────────────────────────────────────
 

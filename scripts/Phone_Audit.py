@@ -20,8 +20,8 @@ password = os.getenv("password")
 secret = os.getenv("secret")
 
 # ============================ USER CONFIG ===================================
-IP_LIST_PATH = r"C:\Users\dmckella\Desktop\Phone Audit\IP.xlsx"         # Excel/CSV containing a column with IPs
-OUTPUT_CSV   = r"C:\Users\dmckella\Desktop\Phone Audit\Output\MTE.csv"
+IP_LIST_PATH = str(Path(__file__).resolve().parents[1] / "database" / "IP.xlsx")         # Excel/CSV containing a column with IPs
+OUTPUT_CSV   = str(Path(__file__).resolve().parents[1] / "docs" / "MTE.csv")
 
 # Column name candidates for the IP address in your file (case-insensitive).
 IP_COL_CANDIDATES = ["ip", "ip_address", "address", "management_ip", "mgmt_ip", "host"]

@@ -15,7 +15,8 @@ password = os.getenv("password")
 secret = os.getenv("secret")
 
 # Load device IPs from Excel
-df = pd.read_excel(r'C:\Users\dmckella\Desktop\WriteMem.xlsx')  # Update file name if needed
+INPUT_FILE = Path(__file__).resolve().parents[1] / "database" / "WriteMem.xlsx"
+df = pd.read_excel(INPUT_FILE)  # Update file name if needed
 
 # Lock for thread-safe printing
 print_lock = threading.Lock()

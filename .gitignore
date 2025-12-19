@@ -26,3 +26,7 @@ outputs/
 inventory/hosts.yml
 inventory/devices.yml
 inventory/group_vars/
+
+# Database
+database/
+*.xlsx

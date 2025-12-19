@@ -104,7 +104,7 @@ def main() -> None:
             for stray, vias in sorted(stray_map.items())
         ]
         out_df = pd.DataFrame(out_rows)
-        outfile = Path("undocumented_switches.xlsx")
+        outfile = Path(__file__).resolve().parents[1] / "docs" / "undocumented_switches.xlsx"
         out_df.to_excel(outfile, index=False)
         print(f"[+] FOUND {len(out_df)} undocumented switch(es). Saved to {outfile.resolve()}")
     else:
