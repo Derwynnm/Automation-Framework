@@ -1,0 +1,28 @@
+# Virtual environment
+venv/
+.venv/
+
+# Environment variables
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VS Code
+.vscode/
+
+# Logs
+logs/
+*.log
+
+# Runtime artifacts
+tmp/
+outputs/
+*.csv
+!example_*.csv
+
+# Inventory
+inventory/hosts.yml
+inventory/devices.yml
+inventory/group_vars/
