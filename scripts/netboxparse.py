@@ -9,9 +9,12 @@ from pathlib import Path
 env_path = Path(__file__).resolve().parents[1] / ".env"  # go up to repo root
 load_dotenv(env_path)
 
-# ----- Calling .env
+# -------- Calling .env ---------
 NETBOX_URL=os.getenv("NETBOX_URL")
 NETBOX_TOKEN=os.getenv("NETBOX_TOKEN")
+DEVICE_USERNAME = os.getenv("username")
+DEVICE_PASSWORD = os.getenv("password")
+DEVICE_SECRET = os.getenv("secret")
 
 # ========= CONFIG =========
 NETBOX_URL   = NETBOX_URL
@@ -29,7 +32,22 @@ nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
 def load_inventory(path=DEVICE_YAML):
     with open(path, "r") as f:
         data = yaml.safe_load(f)
-    return data["devices"]
+    devices = data["devices"]
+    for dev in devices:
+        if "username" not in dev and DEVICE_USERNAME:
+            dev["username"] = DEVICE_USERNAME
+        if "password" not in dev and DEVICE_PASSWORD:
+            dev["password"] = DEVICE_PASSWORD
+        if "secret" not in dev and DEVICE_SECRET:
+            dev["secret"] = DEVICE_SECRET
+
+        missing = [k for k in ("username", "password") if not dev.get(k)]
+        if missing:
+            raise ValueError(
+                f"Device {dev.get('name', '<unknown>')} missing {missing}. "
+                "Set in devices.yml or .env (DEVICE_USERNAME/DEVICE_PASSWORD)."
+            )
+    return devices
 
 
 def get_site_from_netbox(name):
@@ -274,12 +292,16 @@ def parse_ip_interface(output):
 # ---------- Device sync ----------
 
 def collect_switch_data(dev):
-    conn = ConnectHandler(
-        device_type=dev["device_type"],
-        host=dev["host"],
-        username=dev["username"],
-        password=dev["password"],
-    )
+    conn_params = {
+        "device_type": dev["device_type"],
+        "host": dev["host"],
+        "username": dev["username"],
+        "password": dev["password"],
+    }
+    if dev.get("secret"):
+        conn_params["secret"] = dev["secret"]
+
+    conn = ConnectHandler(**conn_params)
     vlan_output = conn.send_command("show vlan brief")
     swp_output  = conn.send_command("show interfaces switchport")
     ip_output   = conn.send_command("show ip interface")
