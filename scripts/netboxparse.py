@@ -25,6 +25,7 @@ NETBOX_URL   = NETBOX_URL
 NETBOX_TOKEN = NETBOX_TOKEN
 DEVICE_CSV       = Path(__file__).resolve().parents[1] / "inventory" / "devices.csv"
 DISCOVERY_WORKERS = 5
+DRY_RUN = os.getenv("DRY_RUN", "").strip().lower() in ("1", "true", "yes", "y")
 # ==========================
 
 nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
@@ -110,6 +111,9 @@ def get_or_create_vlan_group(site, group_name):
                 break
 
     if not group:
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would create VLAN group '{group_name}' for site={site.name if site else 'None'}")
+            return None
         payload = {
             "name": group_name,
             "slug": group_name.lower().replace(" ", "-"),
@@ -125,6 +129,8 @@ def ensure_vlan_in_netbox(vlan, site, group):
     """
     vlan = {"id": 10, "name": "STUDENT"}
     """
+    if not group:
+        return None
     existing = nb.ipam.vlans.get(vid=vlan["id"], group_id=group.id)
     if existing:
         changed = False
@@ -137,8 +143,15 @@ def ensure_vlan_in_netbox(vlan, site, group):
             existing.site = None
             changed = True
         if changed:
-            existing.save()
+            if DRY_RUN:
+                print(f"  [DRY RUN] Would update VLAN {vlan['id']} name/group in NetBox")
+            else:
+                existing.save()
         return existing
+
+    if DRY_RUN:
+        print(f"  [DRY RUN] Would create VLAN {vlan['id']} ({vlan['name']}) in group {group.name}")
+        return None
 
     return nb.ipam.vlans.create({
         "vid": vlan["id"],
@@ -148,8 +161,13 @@ def ensure_vlan_in_netbox(vlan, site, group):
 
 
 def ensure_interface_in_netbox(nb_device, if_name):
+    if not nb_device:
+        return None
     nb_iface = nb.dcim.interfaces.get(device_id=nb_device.id, name=if_name)
     if not nb_iface:
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would create L2 interface {if_name}")
+            return None
         nb_iface = nb.dcim.interfaces.create({
             "device": nb_device.id,
             "name": if_name,
@@ -182,6 +200,8 @@ def ensure_l3_interface(nb_device, if_name):
     Creates an SVI, routed port, or loopback interface if missing.
     """
 
+    if not nb_device:
+        return None
     nb_iface = nb.dcim.interfaces.get(device_id=nb_device.id, name=if_name)
     if nb_iface:
         return nb_iface
@@ -195,6 +215,10 @@ def ensure_l3_interface(nb_device, if_name):
         iface_type = "virtual"
     else:
         iface_type = detect_interface_type(if_name)
+
+    if DRY_RUN:
+        print(f"  [DRY RUN] Would create L3 interface {if_name} type={iface_type}")
+        return None
 
     nb_iface = nb.dcim.interfaces.create({
         "device": nb_device.id,
@@ -372,6 +396,10 @@ def ensure_device_in_netbox(dev, site):
         if site:
             payload["site"] = site.id
 
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would create device {dev['name']} in NetBox")
+            return None
+
         nb_device = nb.dcim.devices.create(payload)
         print(f"  [NEW DEVICE] Created {dev['name']} in NetBox")
         return nb_device
@@ -379,9 +407,12 @@ def ensure_device_in_netbox(dev, site):
     desired_site_id = site.id if site else None
     current_site_id = nb_device.site.id if nb_device.site else None
     if desired_site_id != current_site_id:
-        nb_device.site = desired_site_id
-        nb_device.save()
-        print(f"  [DEVICE] Updated site for {dev['name']} to {site.name if site else 'None'}")
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would update site for {dev['name']} to {site.name if site else 'None'}")
+        else:
+            nb_device.site = desired_site_id
+            nb_device.save()
+            print(f"  [DEVICE] Updated site for {dev['name']} to {site.name if site else 'None'}")
 
     return nb_device
 
@@ -408,6 +439,9 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
     print(f"=== Processing {dev['name']} ({dev['host']}) site={site.name if site else 'None'} ===")
 
     nb_device = ensure_device_in_netbox(dev, site)
+    if not nb_device and DRY_RUN:
+        print(f"  [DRY RUN] Skipping NetBox updates for {dev['name']} (device missing)")
+        return
 
     vlans    = parse_vlans(vlan_output)
     swp_info = parse_switchport(swp_output)
@@ -418,14 +452,19 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
     # VLANs
     group_name = facility_id or "UNKNOWN"
     group = get_or_create_vlan_group(site, group_name)
+    if not group and DRY_RUN:
+        print(f"  [DRY RUN] VLAN group missing; VLAN updates skipped for {dev['name']}")
     vlan_map = {}
     for v in vlans:
         nb_vlan = ensure_vlan_in_netbox(v, site, group)
-        vlan_map[v["id"]] = nb_vlan
+        if nb_vlan:
+            vlan_map[v["id"]] = nb_vlan
 
     # Interfaces + switchport modes/VLANs
     for if_name, info in swp_info.items():
         nb_iface = ensure_interface_in_netbox(nb_device, if_name)
+        if not nb_iface and DRY_RUN:
+            continue
 
         desired_mode = None
         desired_untagged = None
@@ -461,12 +500,16 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
                 changed = True
 
         if changed:
-            try:
-                nb_iface.save()
-                print(f"  [IF] Updated {if_name}: mode={desired_mode}, "
+            if DRY_RUN:
+                print(f"  [DRY RUN] Would update {if_name}: mode={desired_mode}, "
                       f"untagged={desired_untagged}, tagged={desired_tagged}")
-            except RequestError as e:
-                print(f"  [IF] NetBox rejected {if_name}: {e.error}")
+            else:
+                try:
+                    nb_iface.save()
+                    print(f"  [IF] Updated {if_name}: mode={desired_mode}, "
+                          f"untagged={desired_untagged}, tagged={desired_tagged}")
+                except RequestError as e:
+                    print(f"  [IF] NetBox rejected {if_name}: {e.error}")
 
     # IP addresses on L3 interfaces (SVIs, routed ports, loopbacks)
     for entry in ip_info:
@@ -474,31 +517,39 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
         cidr    = entry["cidr"]
 
         nb_iface = ensure_l3_interface(nb_device, if_name)
+        if not nb_iface and DRY_RUN:
+            continue
 
         existing = nb.ipam.ip_addresses.get(address=cidr)
         if existing:
             # ensure attached to correct interface
             if (existing.assigned_object_type != "dcim.interface" or
                     existing.assigned_object_id != nb_iface.id):
-                existing.assigned_object_type = "dcim.interface"
-                existing.assigned_object_id   = nb_iface.id
-                existing.save()
-                print(f"  [IP] Re-attached {cidr} to {if_name}")
+                if DRY_RUN:
+                    print(f"  [DRY RUN] Would re-attach {cidr} to {if_name}")
+                else:
+                    existing.assigned_object_type = "dcim.interface"
+                    existing.assigned_object_id   = nb_iface.id
+                    existing.save()
+                    print(f"  [IP] Re-attached {cidr} to {if_name}")
             continue
 
-        nb_ip = nb.ipam.ip_addresses.create({
-            "address": cidr,
-            "assigned_object_type": "dcim.interface",
-            "assigned_object_id": nb_iface.id,
-        })
-        print(f"  [IP] Created {cidr} on {if_name}")
+        if DRY_RUN:
+            print(f"  [DRY RUN] Would create {cidr} on {if_name}")
+        else:
+            nb_ip = nb.ipam.ip_addresses.create({
+                "address": cidr,
+                "assigned_object_type": "dcim.interface",
+                "assigned_object_id": nb_iface.id,
+            })
+            print(f"  [IP] Created {cidr} on {if_name}")
 
 
 def main():
     devices = load_inventory()
     site_map = build_site_map()
 
-    print(f">>> Loaded {len(devices)} devices; discovery_workers={DISCOVERY_WORKERS}; netbox_workers=1")
+    print(f">>> Loaded {len(devices)} devices; discovery_workers={DISCOVERY_WORKERS}; netbox_workers=1; dry_run={DRY_RUN}")
 
     results_q = queue.Queue()
 
