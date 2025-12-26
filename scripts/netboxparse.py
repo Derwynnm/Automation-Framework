@@ -280,10 +280,13 @@ def ensure_device_in_netbox(dev, site):
         raise ValueError(f"Site mapping failed for {dev['name']} (hostname did not contain a known Facility code).")
 
     payload = {
-        "name": dev["name"],
-        "device_type": device_type.id,
-        "device_role": device_role.id,
-        "site": site.id,
+    "name": dev["name"],
+    "device_type": device_type.id,
+    "site": site.id,
+
+    # compatibility across NetBox versions/serializers
+    "device_role": device_role.id,
+    "role": device_role.id,
     }
 
     if DRY_RUN:
