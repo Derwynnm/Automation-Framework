@@ -1,5 +1,9 @@
 import os
-import yaml
+import csv
+import re
+import queue
+import threading
+import concurrent.futures
 from netmiko import ConnectHandler
 import pynetbox
 from pynetbox.core.query import RequestError
@@ -19,9 +23,8 @@ DEVICE_SECRET = os.getenv("secret")
 # ========= CONFIG =========
 NETBOX_URL   = NETBOX_URL
 NETBOX_TOKEN = NETBOX_TOKEN
-NETBOX_SITE_NAME = "Sandbox"
-VLAN_GROUP_NAME  = "Sandbox"
-DEVICE_YAML      = Path(__file__).resolve().parents[1] / "inventory" / "devices.yml"
+DEVICE_CSV       = Path(__file__).resolve().parents[1] / "inventory" / "devices.csv"
+DISCOVERY_WORKERS = 5
 # ==========================
 
 nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
@@ -29,10 +32,33 @@ nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
 
 # ---------- Helpers ----------
 
-def load_inventory(path=DEVICE_YAML):
-    with open(path, "r") as f:
-        data = yaml.safe_load(f)
-    devices = data["devices"]
+def load_inventory(path=DEVICE_CSV):
+    devices = []
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if not row:
+                continue
+            dev = {}
+            for k, v in row.items():
+                if not k:
+                    continue
+                key = k.strip()
+                val = v.strip() if isinstance(v, str) else v
+                dev[key] = val
+            # Accept common header variants from simple exports
+            if "Device Name" in dev and "name" not in dev:
+                dev["name"] = dev.get("Device Name")
+            if "IP Address" in dev and "host" not in dev:
+                dev["host"] = dev.get("IP Address")
+            if not any(dev.values()):
+                continue
+            if not dev.get("name") and dev.get("hostname"):
+                dev["name"] = dev["hostname"]
+            if not dev.get("host") and dev.get("ip"):
+                dev["host"] = dev["ip"]
+            devices.append(dev)
+
     for dev in devices:
         if "username" not in dev and DEVICE_USERNAME:
             dev["username"] = DEVICE_USERNAME
@@ -45,27 +71,53 @@ def load_inventory(path=DEVICE_YAML):
         if missing:
             raise ValueError(
                 f"Device {dev.get('name', '<unknown>')} missing {missing}. "
-                "Set in devices.yml or .env (DEVICE_USERNAME/DEVICE_PASSWORD)."
+                "Set in devices.csv or .env (DEVICE_USERNAME/DEVICE_PASSWORD)."
             )
     return devices
 
 
-def get_site_from_netbox(name):
-    site = nb.dcim.sites.get(name=name)
-    if not site:
-        raise ValueError(f"Site '{name}' not found in NetBox.")
-    return site
+def extract_facility_id(text):
+    if not text:
+        return None
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", text)
+    if len(cleaned) < 3:
+        return None
+    return cleaned[:3].upper()
 
 
-def get_or_create_vlan_group(site):
-    group = nb.ipam.vlan_groups.get(name=VLAN_GROUP_NAME, scope_id=site.id)
+def build_site_map():
+    site_map = {}
+    for site in nb.dcim.sites.all():
+        for candidate in (site.name, site.slug):
+            fid = extract_facility_id(candidate)
+            if fid and fid not in site_map:
+                site_map[fid] = site
+    return site_map
+
+
+def get_or_create_vlan_group(site, group_name):
+    if site:
+        group = nb.ipam.vlan_groups.get(
+            name=group_name,
+            scope_type="dcim.site",
+            scope_id=site.id,
+        )
+    else:
+        group = None
+        for candidate in nb.ipam.vlan_groups.filter(name=group_name):
+            if not candidate.scope_type and not candidate.scope_id:
+                group = candidate
+                break
+
     if not group:
-        group = nb.ipam.vlan_groups.create({
-            "name": VLAN_GROUP_NAME,
-            "slug": VLAN_GROUP_NAME.lower().replace(" ", "-"),
-            "scope_type": "dcim.site",
-            "scope_id": site.id,
-        })
+        payload = {
+            "name": group_name,
+            "slug": group_name.lower().replace(" ", "-"),
+        }
+        if site:
+            payload["scope_type"] = "dcim.site"
+            payload["scope_id"] = site.id
+        group = nb.ipam.vlan_groups.create(payload)
     return group
 
 
@@ -291,6 +343,49 @@ def parse_ip_interface(output):
 
 # ---------- Device sync ----------
 
+def ensure_device_in_netbox(dev, site):
+    nb_device = nb.dcim.devices.get(name=dev["name"])
+    if not nb_device:
+        nb_type_name = dev.get("netbox_device_type") or dev.get("nb_device_type")
+        nb_role_name = dev.get("netbox_device_role") or dev.get("nb_device_role") or dev.get("device_role")
+        if not nb_type_name or not nb_role_name:
+            raise ValueError(
+                f"Device {dev['name']} not found in NetBox. "
+                "Add it first, or include netbox_device_type and netbox_device_role in devices.csv."
+            )
+
+        device_type = (nb.dcim.device_types.get(slug=nb_type_name) or
+                       nb.dcim.device_types.get(model=nb_type_name))
+        if not device_type:
+            raise ValueError(f"NetBox device_type '{nb_type_name}' not found for {dev['name']}")
+
+        device_role = (nb.dcim.device_roles.get(slug=nb_role_name) or
+                       nb.dcim.device_roles.get(name=nb_role_name))
+        if not device_role:
+            raise ValueError(f"NetBox device_role '{nb_role_name}' not found for {dev['name']}")
+
+        payload = {
+            "name": dev["name"],
+            "device_type": device_type.id,
+            "device_role": device_role.id,
+        }
+        if site:
+            payload["site"] = site.id
+
+        nb_device = nb.dcim.devices.create(payload)
+        print(f"  [NEW DEVICE] Created {dev['name']} in NetBox")
+        return nb_device
+
+    desired_site_id = site.id if site else None
+    current_site_id = nb_device.site.id if nb_device.site else None
+    if desired_site_id != current_site_id:
+        nb_device.site = desired_site_id
+        nb_device.save()
+        print(f"  [DEVICE] Updated site for {dev['name']} to {site.name if site else 'None'}")
+
+    return nb_device
+
+
 def collect_switch_data(dev):
     conn_params = {
         "device_type": dev["device_type"],
@@ -309,14 +404,10 @@ def collect_switch_data(dev):
     return vlan_output, swp_output, ip_output
 
 
-def sync_device(dev, site):
-    print(f"=== Processing {dev['name']} ({dev['host']}) ===")
+def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_output):
+    print(f"=== Processing {dev['name']} ({dev['host']}) site={site.name if site else 'None'} ===")
 
-    nb_device = nb.dcim.devices.get(name=dev["name"])
-    if not nb_device:
-        raise ValueError(f"Device {dev['name']} not found in NetBox")
-
-    vlan_output, swp_output, ip_output = collect_switch_data(dev)
+    nb_device = ensure_device_in_netbox(dev, site)
 
     vlans    = parse_vlans(vlan_output)
     swp_info = parse_switchport(swp_output)
@@ -325,7 +416,8 @@ def sync_device(dev, site):
     print(f"  Found {len(vlans)} VLANs, {len(swp_info)} switchports, {len(ip_info)} L3 interfaces")
 
     # VLANs
-    group = get_or_create_vlan_group(site)
+    group_name = facility_id or "UNKNOWN"
+    group = get_or_create_vlan_group(site, group_name)
     vlan_map = {}
     for v in vlans:
         nb_vlan = ensure_vlan_in_netbox(v, site, group)
@@ -404,12 +496,59 @@ def sync_device(dev, site):
 
 def main():
     devices = load_inventory()
-    site = get_site_from_netbox(NETBOX_SITE_NAME)
+    site_map = build_site_map()
 
-    print(f">>> Loaded {len(devices)} devices; site={site.name}")
+    print(f">>> Loaded {len(devices)} devices; discovery_workers={DISCOVERY_WORKERS}; netbox_workers=1")
 
-    for dev in devices:
-        sync_device(dev, site)
+    results_q = queue.Queue()
+
+    def netbox_worker():
+        while True:
+            item = results_q.get()
+            if item is None:
+                results_q.task_done()
+                break
+            dev = item["dev"]
+            facility_id = extract_facility_id(dev.get("name", ""))
+            site = site_map.get(facility_id)
+            try:
+                push_device_to_netbox(
+                    dev,
+                    site,
+                    facility_id,
+                    item["vlan_output"],
+                    item["swp_output"],
+                    item["ip_output"],
+                )
+            except Exception as exc:
+                print(f"  [NETBOX ERROR] {dev.get('name', '<unknown>')}: {exc}")
+            finally:
+                results_q.task_done()
+
+    nb_thread = threading.Thread(target=netbox_worker, daemon=True)
+    nb_thread.start()
+
+    def discover(dev):
+        vlan_output, swp_output, ip_output = collect_switch_data(dev)
+        return {
+            "dev": dev,
+            "vlan_output": vlan_output,
+            "swp_output": swp_output,
+            "ip_output": ip_output,
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=DISCOVERY_WORKERS) as executor:
+        futures = {executor.submit(discover, dev): dev for dev in devices}
+        for future in concurrent.futures.as_completed(futures):
+            dev = futures[future]
+            try:
+                results_q.put(future.result())
+            except Exception as exc:
+                print(f"  [DISCOVERY ERROR] {dev.get('name', '<unknown>')}: {exc}")
+
+    results_q.put(None)
+    results_q.join()
+    nb_thread.join()
 
     print(">>> Done.")
 
