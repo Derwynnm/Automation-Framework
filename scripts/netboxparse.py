@@ -57,7 +57,6 @@ def strip_bom(s: str) -> str:
 
 
 def normalize_key(k: str) -> str:
-    # trims, strips BOM, collapses weird whitespace
     k = strip_bom(k.strip())
     k = re.sub(r"\s+", " ", k)
     return k
@@ -69,25 +68,6 @@ def normalize_value(v):
     return v
 
 
-def extract_facility_id(text):
-    if not text:
-        return None
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", text)
-    if len(cleaned) < 3:
-        return None
-    return cleaned[:3].upper()
-
-
-def build_site_map():
-    site_map = {}
-    for site in nb.dcim.sites.all():
-        for candidate in (site.name, site.slug):
-            fid = extract_facility_id(candidate)
-            if fid and fid not in site_map:
-                site_map[fid] = site
-    return site_map
-
-
 def infer_device_role_from_type(device_type_name: str):
     """
     Infer a NetBox ROLE (not model, not netmiko platform).
@@ -96,9 +76,49 @@ def infer_device_role_from_type(device_type_name: str):
     if not device_type_name:
         return None
     lowered = device_type_name.lower()
-    # Catch common Cisco family strings
     if any(x in lowered for x in ("catalyst", "switch", "9200", "9300", "9500", "35xx", "3560", "3750", "3850")):
         return "switch"
+    return None
+
+
+# =========================
+# SITE MAP (UPDATED)
+# =========================
+def build_site_map():
+    """
+    Build a mapping of Facility Code -> Site object.
+    This uses the NetBox Site 'facility' field (ACE, BSE, PHS, FSC, etc).
+    """
+    site_map = {}
+    for site in nb.dcim.sites.all():
+        facility = getattr(site, "facility", None)
+        if facility and isinstance(facility, str):
+            code = facility.strip().upper()
+            if code:
+                site_map[code] = site
+    return site_map
+
+
+def extract_facility_id_from_hostname(hostname: str, site_map: dict):
+    """
+    Extract facility code from hostname by looking for a token that matches a known facility code.
+    Example tokens come from splitting on '-', '_', '.', etc.
+    """
+    if not hostname:
+        return None
+
+    tokens = re.split(r"[^A-Za-z0-9]+", hostname.upper())
+
+    # Exact token match
+    for t in tokens:
+        if t in site_map:
+            return t
+
+    # Fallback: if the first 3 alnum chars match a code, accept it
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", hostname.upper())
+    if len(cleaned) >= 3 and cleaned[:3] in site_map:
+        return cleaned[:3]
+
     return None
 
 
@@ -114,14 +134,12 @@ def normalize_row(row: dict) -> dict:
         val = normalize_value(v)
         dev[key] = val
 
-    # Header variants from your CSV
-    # "Device Name" / "IP Address" / "Device Type"
+    # Header variants
     if "Device Name" in dev and "name" not in dev:
         dev["name"] = dev.get("Device Name")
     if "IP Address" in dev and "host" not in dev:
         dev["host"] = dev.get("IP Address")
     if "Device Type" in dev and "netbox_device_type" not in dev:
-        # This is a model hint for NetBox (often family/category, not exact model)
         dev["netbox_device_type"] = dev.get("Device Type")
 
     # Alternate common fields
@@ -130,7 +148,7 @@ def normalize_row(row: dict) -> dict:
     if not dev.get("host") and dev.get("ip"):
         dev["host"] = dev.get("ip")
 
-    # Netmiko platform always set (prevents KeyError: 'device_type')
+    # Netmiko platform always set
     if not dev.get("device_type"):
         dev["device_type"] = NETMIKO_DEVICE_TYPE_DEFAULT
 
@@ -153,7 +171,6 @@ def normalize_row(row: dict) -> dict:
 
 def load_inventory(path=DEVICE_CSV):
     devices = []
-    # utf-8-sig strips Excel BOM cleanly
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -162,16 +179,13 @@ def load_inventory(path=DEVICE_CSV):
 
             dev = normalize_row(row)
 
-            # Skip completely empty rows
             if not any(dev.values()):
                 continue
 
-            # Validate minimums
             if not dev.get("name") or not dev.get("host"):
                 print(f"  [INVENTORY SKIP] Missing name/host: {dev}")
                 continue
 
-            # Ensure creds exist
             missing = [k for k in ("username", "password") if not dev.get(k)]
             if missing:
                 raise ValueError(
@@ -179,9 +193,7 @@ def load_inventory(path=DEVICE_CSV):
                     "Set in devices.csv or .env (DEVICE_USERNAME/DEVICE_PASSWORD)."
                 )
 
-            # Enforce device_type always present
             dev["device_type"] = dev.get("device_type") or NETMIKO_DEVICE_TYPE_DEFAULT
-
             devices.append(dev)
 
     return devices
@@ -192,12 +204,11 @@ def load_inventory(path=DEVICE_CSV):
 # =========================
 def resolve_device_type(nb_type_name: str):
     """
-    Try to resolve a real NetBox DeviceType from CSV-provided string.
-    If it doesn't match, fallback to your placeholder: unknown-catalyst-switch.
+    Resolve a NetBox DeviceType from CSV-provided string.
+    Falls back to placeholder device type (unknown-catalyst-switch) if no match.
     """
     device_type = None
     if nb_type_name:
-        # direct attempts
         device_type = (
             nb.dcim.device_types.get(slug=nb_type_name)
             or nb.dcim.device_types.get(model=nb_type_name)
@@ -206,7 +217,6 @@ def resolve_device_type(nb_type_name: str):
         if device_type:
             return device_type
 
-        # fuzzy-ish search
         query = nb_type_name.strip()
         candidates = nb.dcim.device_types.filter(q=query)
         q_lower = query.lower()
@@ -215,33 +225,20 @@ def resolve_device_type(nb_type_name: str):
                 if field and field.strip().lower() == q_lower:
                     return c
 
-    # fallback placeholder
-    fallback = nb.dcim.device_types.get(slug=FALLBACK_NETBOX_DEVICE_TYPE_SLUG)
-    return fallback
+    return nb.dcim.device_types.get(slug=FALLBACK_NETBOX_DEVICE_TYPE_SLUG)
 
 
 def resolve_device_role(role_name: str):
-    """
-    Resolve a NetBox DeviceRole from a string.
-    If missing/unresolvable, fallback to FALLBACK_DEVICE_ROLE.
-    """
     role = None
     if role_name:
         role = nb.dcim.device_roles.get(slug=role_name) or nb.dcim.device_roles.get(name=role_name)
         if role:
             return role
 
-    # fallback
-    role = nb.dcim.device_roles.get(slug=FALLBACK_DEVICE_ROLE) or nb.dcim.device_roles.get(name=FALLBACK_DEVICE_ROLE)
-    return role
+    return nb.dcim.device_roles.get(slug=FALLBACK_DEVICE_ROLE) or nb.dcim.device_roles.get(name=FALLBACK_DEVICE_ROLE)
 
 
 def ensure_device_in_netbox(dev, site):
-    """
-    Ensures the device exists. If missing, creates it using:
-    - resolved NetBox DeviceType (or fallback unknown-catalyst-switch)
-    - resolved DeviceRole (or fallback switch)
-    """
     nb_device = nb.dcim.devices.get(name=dev["name"])
     if nb_device:
         # update site if needed
@@ -276,32 +273,30 @@ def ensure_device_in_netbox(dev, site):
     if nb_type_name and device_type.slug == FALLBACK_NETBOX_DEVICE_TYPE_SLUG:
         print(f"  [DEVICE TYPE FALLBACK] {dev['name']}: '{nb_type_name}' -> '{device_type.model}'")
 
+    if not site:
+        # Your NetBox requires site. If mapping fails, you MUST choose a strategy:
+        # 1) create a "STAGING" site and use it here, OR
+        # 2) skip the device.
+        raise ValueError(f"Site mapping failed for {dev['name']} (hostname did not contain a known Facility code).")
+
     payload = {
         "name": dev["name"],
         "device_type": device_type.id,
         "device_role": device_role.id,
+        "site": site.id,
     }
-    if site:
-        payload["site"] = site.id
 
     if DRY_RUN:
-        print(f"  [DRY RUN] Would create device {dev['name']} in NetBox (type={device_type.model}, role={device_role.name})")
+        print(f"  [DRY RUN] Would create device {dev['name']} (type={device_type.model}, role={device_role.name}, site={site.name})")
         return None
 
     created = nb.dcim.devices.create(payload)
-    print(f"  [NEW DEVICE] Created {dev['name']} in NetBox (type={device_type.model}, role={device_role.name})")
+    print(f"  [NEW DEVICE] Created {dev['name']} (type={device_type.model}, role={device_role.name}, site={site.name})")
     return created
 
 
 def get_or_create_vlan_group(site, group_name):
-    if site:
-        group = nb.ipam.vlan_groups.get(name=group_name, scope_type="dcim.site", scope_id=site.id)
-    else:
-        group = None
-        for candidate in nb.ipam.vlan_groups.filter(name=group_name):
-            if not candidate.scope_type and not candidate.scope_id:
-                group = candidate
-                break
+    group = nb.ipam.vlan_groups.get(name=group_name, scope_type="dcim.site", scope_id=site.id) if site else None
 
     if not group:
         if DRY_RUN:
@@ -328,7 +323,7 @@ def ensure_vlan_in_netbox(vlan, group):
             changed = True
         if changed:
             if DRY_RUN:
-                print(f"  [DRY RUN] Would update VLAN {vlan['id']} name in NetBox")
+                print(f"  [DRY RUN] Would update VLAN {vlan['id']} name")
             else:
                 existing.save()
         return existing
@@ -406,9 +401,6 @@ def parse_vlans(vlan_output):
 
 
 def parse_switchport(output):
-    """
-    Parses 'show interfaces switchport' output into dict keyed by interface name.
-    """
     result = {}
     current = None
 
@@ -452,13 +444,6 @@ def parse_switchport(output):
 
 
 def parse_ip_interface(output):
-    """
-    Parse 'show ip interface' into:
-    [
-      {"name": "Vlan1", "cidr": "10.1.1.10/24"},
-      ...
-    ]
-    """
     results = []
     current_int = None
 
@@ -492,7 +477,6 @@ def parse_ip_interface(output):
 # DISCOVERY + NETBOX PUSH
 # =========================
 def collect_switch_data(dev):
-    # jitter so we don't stampede the management plane
     time.sleep(random.uniform(0.2, 1.0))
 
     conn_params = {
@@ -524,12 +508,9 @@ def collect_switch_data(dev):
 
 
 def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_output):
-    print(f"=== Processing {dev['name']} ({dev['host']}) site={site.name if site else 'None'} ===")
+    print(f"=== Processing {dev['name']} ({dev['host']}) facility={facility_id} site={site.name if site else 'None'} ===")
 
     nb_device = ensure_device_in_netbox(dev, site)
-    if not nb_device and DRY_RUN:
-        # device would be created but not actually present in DRY_RUN
-        pass
 
     vlans = parse_vlans(vlan_output)
     swp_info = parse_switchport(swp_output)
@@ -546,7 +527,6 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
         if nb_vlan:
             vlan_map[v["id"]] = nb_vlan
 
-    # L2 switchport updates
     for if_name, info in swp_info.items():
         nb_iface = ensure_interface(nb_device, if_name)
         if not nb_iface and DRY_RUN:
@@ -602,7 +582,6 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
                 except RequestError as e:
                     print(f"  [IF] NetBox rejected {if_name}: {getattr(e, 'error', e)}")
 
-    # L3 IPs (SVIs, routed ports, loopbacks) - minimal attachment logic
     for entry in ip_info:
         if_name = entry["name"]
         cidr = entry["cidr"]
@@ -652,9 +631,14 @@ def main():
             try:
                 if item is None:
                     return
+
                 dev = item["dev"]
-                facility_id = extract_facility_id(dev.get("name", ""))
+                facility_id = extract_facility_id_from_hostname(dev.get("name", ""), site_map)
                 site = site_map.get(facility_id)
+
+                # Debug to confirm mapping works
+                print(f"[SITE MAP] {dev['name']} -> facility_id={facility_id} -> site={site.name if site else None}")
+
                 push_device_to_netbox(
                     dev,
                     site,
