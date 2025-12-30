@@ -36,6 +36,7 @@ DRY_RUN = os.getenv("DRY_RUN", "").strip().lower() in ("1", "true", "yes", "y")
 
 CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "15"))
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "25"))
+READ_TIMEOUT = int(os.getenv("READ_TIMEOUT", "60"))
 
 # You created this in NetBox — used as model fallback for messy CSV strings like "Catalyst 35xx"
 FALLBACK_NETBOX_DEVICE_TYPE_SLUG = os.getenv("FALLBACK_NETBOX_DEVICE_TYPE_SLUG", "unknown-catalyst-switch")
@@ -549,10 +550,14 @@ def collect_switch_data(dev):
             conn.enable()
         except Exception:
             pass
+    try:
+        conn.send_command("terminal length 0", read_timeout=READ_TIMEOUT)
+    except Exception:
+        pass
 
-    vlan_output = conn.send_command("show vlan brief", read_timeout=COMMAND_TIMEOUT)
-    swp_output = conn.send_command("show interfaces switchport", read_timeout=COMMAND_TIMEOUT)
-    ip_output = conn.send_command("show ip interface", read_timeout=COMMAND_TIMEOUT)
+    vlan_output = conn.send_command("show vlan brief", read_timeout=READ_TIMEOUT)
+    swp_output = conn.send_command("show interfaces switchport", read_timeout=READ_TIMEOUT)
+    ip_output = conn.send_command("show ip interface", read_timeout=READ_TIMEOUT)
 
     conn.disconnect()
     return vlan_output, swp_output, ip_output
