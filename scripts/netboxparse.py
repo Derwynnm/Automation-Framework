@@ -7,6 +7,7 @@ import random
 import threading
 import concurrent.futures
 from pathlib import Path
+import logging
 
 from netmiko import ConnectHandler
 import pynetbox
@@ -42,11 +43,37 @@ FALLBACK_NETBOX_DEVICE_TYPE_SLUG = os.getenv("FALLBACK_NETBOX_DEVICE_TYPE_SLUG",
 # If role is missing, default to this
 FALLBACK_DEVICE_ROLE = os.getenv("FALLBACK_DEVICE_ROLE", "switch")
 
+LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 
 if not NETBOX_URL or not NETBOX_TOKEN:
     raise ValueError("NETBOX_URL and NETBOX_TOKEN must be set in .env")
 
 nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
+
+def setup_logging():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_mode = "dryrun" if DRY_RUN else "run"
+    log_path = LOG_DIR / f"netboxparse_{run_mode}_{timestamp}.log"
+
+    logger = logging.getLogger("netboxparse")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+
+    logger.info("Logging to %s (dry_run=%s)", log_path, DRY_RUN)
+    return logger
+
+
+logger = setup_logging()
 
 
 # =========================
@@ -183,7 +210,7 @@ def load_inventory(path=DEVICE_CSV):
                 continue
 
             if not dev.get("name") or not dev.get("host"):
-                print(f"  [INVENTORY SKIP] Missing name/host: {dev}")
+                logger.warning("  [INVENTORY SKIP] Missing name/host: %s", dev)
                 continue
 
             missing = [k for k in ("username", "password") if not dev.get(k)]
@@ -246,11 +273,11 @@ def ensure_device_in_netbox(dev, site):
         current_site_id = nb_device.site.id if nb_device.site else None
         if desired_site_id != current_site_id:
             if DRY_RUN:
-                print(f"  [DRY RUN] Would update site for {dev['name']} to {site.name if site else 'None'}")
+                logger.info("  [DRY RUN] Would update site for %s to %s", dev["name"], site.name if site else "None")
             else:
                 nb_device.site = desired_site_id
                 nb_device.save()
-                print(f"  [DEVICE] Updated site for {dev['name']} to {site.name if site else 'None'}")
+                logger.info("  [DEVICE] Updated site for %s to %s", dev["name"], site.name if site else "None")
         return nb_device
 
     nb_type_name = dev.get("netbox_device_type") or dev.get("nb_device_type")
@@ -271,7 +298,7 @@ def ensure_device_in_netbox(dev, site):
         )
 
     if nb_type_name and device_type.slug == FALLBACK_NETBOX_DEVICE_TYPE_SLUG:
-        print(f"  [DEVICE TYPE FALLBACK] {dev['name']}: '{nb_type_name}' -> '{device_type.model}'")
+        logger.info("  [DEVICE TYPE FALLBACK] %s: '%s' -> '%s'", dev["name"], nb_type_name, device_type.model)
 
     if not site:
         # Your NetBox requires site. If mapping fails, you MUST choose a strategy:
@@ -290,11 +317,23 @@ def ensure_device_in_netbox(dev, site):
     }
 
     if DRY_RUN:
-        print(f"  [DRY RUN] Would create device {dev['name']} (type={device_type.model}, role={device_role.name}, site={site.name})")
+        logger.info(
+            "  [DRY RUN] Would create device %s (type=%s, role=%s, site=%s)",
+            dev["name"],
+            device_type.model,
+            device_role.name,
+            site.name,
+        )
         return None
 
     created = nb.dcim.devices.create(payload)
-    print(f"  [NEW DEVICE] Created {dev['name']} (type={device_type.model}, role={device_role.name}, site={site.name})")
+    logger.info(
+        "  [NEW DEVICE] Created %s (type=%s, role=%s, site=%s)",
+        dev["name"],
+        device_type.model,
+        device_role.name,
+        site.name,
+    )
     return created
 
 
@@ -303,7 +342,11 @@ def get_or_create_vlan_group(site, group_name):
 
     if not group:
         if DRY_RUN:
-            print(f"  [DRY RUN] Would create VLAN group '{group_name}' for site={site.name if site else 'None'}")
+            logger.info(
+                "  [DRY RUN] Would create VLAN group '%s' for site=%s",
+                group_name,
+                site.name if site else "None",
+            )
             return None
         payload = {"name": group_name, "slug": group_name.lower().replace(" ", "-")}
         if site:
@@ -326,13 +369,18 @@ def ensure_vlan_in_netbox(vlan, group):
             changed = True
         if changed:
             if DRY_RUN:
-                print(f"  [DRY RUN] Would update VLAN {vlan['id']} name")
+                logger.info("  [DRY RUN] Would update VLAN %s name", vlan["id"])
             else:
                 existing.save()
         return existing
 
     if DRY_RUN:
-        print(f"  [DRY RUN] Would create VLAN {vlan['id']} ({vlan['name']}) in group {group.name}")
+        logger.info(
+            "  [DRY RUN] Would create VLAN %s (%s) in group %s",
+            vlan["id"],
+            vlan["name"],
+            group.name,
+        )
         return None
 
     return nb.ipam.vlans.create({"vid": vlan["id"], "name": vlan["name"], "group": group.id})
@@ -364,7 +412,7 @@ def ensure_interface(nb_device, if_name):
 
     iface_type = detect_interface_type(if_name)
     if DRY_RUN:
-        print(f"  [DRY RUN] Would create interface {if_name} type={iface_type}")
+        logger.info("  [DRY RUN] Would create interface %s type=%s", if_name, iface_type)
         return None
 
     return nb.dcim.interfaces.create({"device": nb_device.id, "name": if_name, "type": iface_type})
@@ -511,7 +559,13 @@ def collect_switch_data(dev):
 
 
 def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_output):
-    print(f"=== Processing {dev['name']} ({dev['host']}) facility={facility_id} site={site.name if site else 'None'} ===")
+    logger.info(
+        "=== Processing %s (%s) facility=%s site=%s ===",
+        dev["name"],
+        dev["host"],
+        facility_id,
+        site.name if site else "None",
+    )
 
     nb_device = ensure_device_in_netbox(dev, site)
 
@@ -519,7 +573,12 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
     swp_info = parse_switchport(swp_output)
     ip_info = parse_ip_interface(ip_output)
 
-    print(f"  Found {len(vlans)} VLANs, {len(swp_info)} switchports, {len(ip_info)} L3 interfaces")
+    logger.info(
+        "  Found %s VLANs, %s switchports, %s L3 interfaces",
+        len(vlans),
+        len(swp_info),
+        len(ip_info),
+    )
 
     group_name = facility_id or "UNKNOWN"
     group = get_or_create_vlan_group(site, group_name)
@@ -571,19 +630,25 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
 
         if changed:
             if DRY_RUN:
-                print(
-                    f"  [DRY RUN] Would update {if_name}: mode={desired_mode}, "
-                    f"untagged={desired_untagged_vlan_id}, tagged={desired_tagged_vlan_ids}"
+                logger.info(
+                    "  [DRY RUN] Would update %s: mode=%s, untagged=%s, tagged=%s",
+                    if_name,
+                    desired_mode,
+                    desired_untagged_vlan_id,
+                    desired_tagged_vlan_ids,
                 )
             else:
                 try:
                     nb_iface.save()
-                    print(
-                        f"  [IF] Updated {if_name}: mode={desired_mode}, "
-                        f"untagged={desired_untagged_vlan_id}, tagged={desired_tagged_vlan_ids}"
+                    logger.info(
+                        "  [IF] Updated %s: mode=%s, untagged=%s, tagged=%s",
+                        if_name,
+                        desired_mode,
+                        desired_untagged_vlan_id,
+                        desired_tagged_vlan_ids,
                     )
                 except RequestError as e:
-                    print(f"  [IF] NetBox rejected {if_name}: {getattr(e, 'error', e)}")
+                    logger.error("  [IF] NetBox rejected %s: %s", if_name, getattr(e, "error", e))
 
     for entry in ip_info:
         if_name = entry["name"]
@@ -597,21 +662,21 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
         if existing:
             if existing.assigned_object_type != "dcim.interface" or existing.assigned_object_id != nb_iface.id:
                 if DRY_RUN:
-                    print(f"  [DRY RUN] Would re-attach {cidr} to {if_name}")
+                    logger.info("  [DRY RUN] Would re-attach %s to %s", cidr, if_name)
                 else:
                     existing.assigned_object_type = "dcim.interface"
                     existing.assigned_object_id = nb_iface.id
                     existing.save()
-                    print(f"  [IP] Re-attached {cidr} to {if_name}")
+                    logger.info("  [IP] Re-attached %s to %s", cidr, if_name)
             continue
 
         if DRY_RUN:
-            print(f"  [DRY RUN] Would create {cidr} on {if_name}")
+            logger.info("  [DRY RUN] Would create %s on %s", cidr, if_name)
         else:
             nb.ipam.ip_addresses.create(
                 {"address": cidr, "assigned_object_type": "dcim.interface", "assigned_object_id": nb_iface.id}
             )
-            print(f"  [IP] Created {cidr} on {if_name}")
+            logger.info("  [IP] Created %s on %s", cidr, if_name)
 
 
 # =========================
@@ -621,9 +686,11 @@ def main():
     devices = load_inventory()
     site_map = build_site_map()
 
-    print(
-        f">>> Loaded {len(devices)} devices; discovery_workers={DISCOVERY_WORKERS}; "
-        f"netbox_workers=1; dry_run={DRY_RUN}"
+    logger.info(
+        ">>> Loaded %s devices; discovery_workers=%s; netbox_workers=1; dry_run=%s",
+        len(devices),
+        DISCOVERY_WORKERS,
+        DRY_RUN,
     )
 
     results_q = queue.Queue()
@@ -640,7 +707,12 @@ def main():
                 site = site_map.get(facility_id)
 
                 # Debug to confirm mapping works
-                print(f"[SITE MAP] {dev['name']} -> facility_id={facility_id} -> site={site.name if site else None}")
+                logger.info(
+                    "[SITE MAP] %s -> facility_id=%s -> site=%s",
+                    dev["name"],
+                    facility_id,
+                    site.name if site else None,
+                )
 
                 push_device_to_netbox(
                     dev,
@@ -654,7 +726,7 @@ def main():
                 dev_name = "<unknown>"
                 if isinstance(item, dict):
                     dev_name = item.get("dev", {}).get("name", "<unknown>")
-                print(f"  [NETBOX ERROR] {dev_name}: {exc}")
+                logger.error("  [NETBOX ERROR] %s: %s", dev_name, exc)
             finally:
                 results_q.task_done()
 
@@ -672,13 +744,13 @@ def main():
             try:
                 results_q.put(future.result())
             except Exception as exc:
-                print(f"  [DISCOVERY ERROR] {dev.get('name', '<unknown>')}: {exc}")
+                logger.error("  [DISCOVERY ERROR] %s: %s", dev.get("name", "<unknown>"), exc)
 
     results_q.put(None)
     results_q.join()
     nb_thread.join()
 
-    print(">>> Done.")
+    logger.info(">>> Done.")
 
 
 if __name__ == "__main__":
