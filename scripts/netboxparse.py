@@ -32,6 +32,7 @@ NETMIKO_DEVICE_TYPE_DEFAULT = os.getenv("NETMIKO_DEVICE_TYPE", "cisco_ios")
 
 DEVICE_CSV = Path(__file__).resolve().parents[1] / "inventory" / "devices.csv"
 DISCOVERY_WORKERS = int(os.getenv("DISCOVERY_WORKERS", "5"))
+NETBOX_WORKERS = int(os.getenv("NETBOX_WORKERS", "1"))
 DRY_RUN = os.getenv("DRY_RUN", "").strip().lower() in ("1", "true", "yes", "y")
 
 CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "15"))
@@ -461,8 +462,9 @@ def parse_switchport(output):
         if not line:
             continue
 
-        if line.startswith("Name:"):
-            name = line.split("Name:")[1].strip()
+        name_match = re.match(r"^Name\s*:\s*(\S+)", line)
+        if name_match:
+            name = name_match.group(1)
             current = {"mode": None, "access_vlan": None, "native_vlan": None, "allowed_vlans": []}
             result[name] = current
             continue
@@ -579,6 +581,11 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
     ip_info = parse_ip_interface(ip_output)
 
     logger.info(
+        "  [OUTPUT] switchport chars=%s lines=%s",
+        len(swp_output),
+        len(swp_output.splitlines()),
+    )
+    logger.info(
         "  Found %s VLANs, %s switchports, %s L3 interfaces",
         len(vlans),
         len(swp_info),
@@ -692,9 +699,10 @@ def main():
     site_map = build_site_map()
 
     logger.info(
-        ">>> Loaded %s devices; discovery_workers=%s; netbox_workers=1; dry_run=%s",
+        ">>> Loaded %s devices; discovery_workers=%s; netbox_workers=%s; dry_run=%s",
         len(devices),
         DISCOVERY_WORKERS,
+        NETBOX_WORKERS,
         DRY_RUN,
     )
 
@@ -735,8 +743,11 @@ def main():
             finally:
                 results_q.task_done()
 
-    nb_thread = threading.Thread(target=netbox_worker, daemon=True)
-    nb_thread.start()
+    nb_threads = []
+    for _ in range(max(NETBOX_WORKERS, 1)):
+        t = threading.Thread(target=netbox_worker, daemon=True)
+        t.start()
+        nb_threads.append(t)
 
     def discover(dev):
         vlan_output, swp_output, ip_output = collect_switch_data(dev)
@@ -751,9 +762,11 @@ def main():
             except Exception as exc:
                 logger.error("  [DISCOVERY ERROR] %s: %s", dev.get("name", "<unknown>"), exc)
 
-    results_q.put(None)
+    for _ in nb_threads:
+        results_q.put(None)
     results_q.join()
-    nb_thread.join()
+    for t in nb_threads:
+        t.join()
 
     logger.info(">>> Done.")
 
