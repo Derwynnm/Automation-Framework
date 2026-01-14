@@ -20,7 +20,7 @@ load_dotenv()
 NB_URL = os.getenv("NETBOX_URL")
 NB_TOKEN = os.getenv("NETBOX_TOKEN")
 
-# Device Type slug for "N/A Wall Jack"
+# Device Type slug for "Wall Jack"
 WALLJACK_DEVICE_TYPE_SLUG = "wall-jack"
 
 # Device Role slug for "Ethernet Wall Plate"
@@ -36,9 +36,8 @@ PANEL_LOCATION_ALIASES = {
 }
 
 
-# =========================
 # Helpers / Types
-# =========================
+
 @dataclass
 class Termination:
     term_type: str  # "dcim.interface" | "dcim.frontport" | "dcim.rearport"
@@ -700,7 +699,7 @@ def main():
             if walljack_id is not None:
                 wj_front, wj_rear = ensure_walljack_ports(w, walljack_id, patch_port)
 
-            # 7) Cable A: Switch IF <-> Patch Panel FRONT (your convention)
+            # 7) Cable A: Switch IF <-> Patch Panel FRONT
             if has_id(sw_iface) and has_id(pp_front):
                 ensure_cable(
                     w,
