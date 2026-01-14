@@ -218,6 +218,26 @@ def build_patch_panel_name(facility_id: str, location_code: str, panel_letter: s
     )
 
 
+def build_site_extras(site) -> dict:
+    extras = {}
+    tenant = getattr(site, "tenant", None)
+    tenant_id = getattr(tenant, "id", None) if tenant else None
+    if tenant_id:
+        extras["tenant"] = tenant_id
+
+    site_facility = getattr(site, "facility", None)
+    site_cf = getattr(site, "custom_fields", None)
+    cf_payload = {}
+    if isinstance(site_cf, dict):
+        if "facility_id" in site_cf:
+            cf_payload["facility_id"] = site_cf.get("facility_id") or site_facility
+        if "facility" in site_cf:
+            cf_payload["facility"] = site_cf.get("facility") or site_facility
+    if cf_payload:
+        extras["custom_fields"] = cf_payload
+    return extras
+
+
 def find_switch_by_primary_ip(nb, ip: str):
     candidates = [ip]
     if "/" not in ip:
@@ -234,7 +254,11 @@ def find_switch_by_primary_ip(nb, ip: str):
 
 
 def get_or_create_location(
-    w: NBWriter, site_id: int, location_name: str, parent_id: Optional[int] = None
+    w: NBWriter,
+    site_id: int,
+    location_name: str,
+    parent_id: Optional[int] = None,
+    site_obj=None,
 ) -> Optional[int]:
     lock = w.lock_for(("location", site_id, location_name, parent_id))
     with lock:
@@ -252,6 +276,8 @@ def get_or_create_location(
             "slug": slugify_location(location_name),
             "status": "active",
         }
+        if site_obj:
+            payload.update(build_site_extras(site_obj))
         if parent_id is not None:
             payload["parent"] = parent_id
         try:
@@ -273,6 +299,7 @@ def get_or_create_device(
     device_type_slug: str,
     role_slug: str,
     location_id: Optional[int] = None,
+    site_obj=None,
 ):
     lock = w.lock_for(("device", site_id, name))
     with lock:
@@ -294,6 +321,8 @@ def get_or_create_device(
         "site": site_id,
         "status": "active",
     }
+    if site_obj:
+        payload.update(build_site_extras(site_obj))
     if location_id is not None:
         payload["location"] = location_id
 
@@ -595,9 +624,10 @@ def main():
         retry_backoff=args.retry_backoff,
     )
     site_id = resolve_site_id(nb, facility_id)
+    site_obj = nb.dcim.sites.get(id=site_id)
     parent_location_id = None
     if parent_location_name:
-        parent_location_id = get_or_create_location(w, site_id, parent_location_name)
+        parent_location_id = get_or_create_location(w, site_id, parent_location_name, site_obj=site_obj)
         if parent_location_id is None:
             raise RuntimeError(f"Failed to create/find parent location: {parent_location_name}")
 
@@ -653,7 +683,9 @@ def main():
                 return
 
             # 2) Ensure room location
-            loc_id = get_or_create_location(w, site_id, room, parent_id=parent_location_id)
+            loc_id = get_or_create_location(
+                w, site_id, room, parent_id=parent_location_id, site_obj=site_obj
+            )
             if loc_id is None:
                 log_room(room, "error", "failed to create/find location")
                 w.log(f"SKIP: failed to create/find location for row: {row}")
@@ -667,6 +699,7 @@ def main():
                 device_type_slug=WALLJACK_DEVICE_TYPE_SLUG,
                 role_slug=WALLJACK_ROLE_SLUG,
                 location_id=loc_id,
+                site_obj=site_obj,
             )
             walljack_id = walljack.id if walljack else None
 
@@ -680,6 +713,7 @@ def main():
                     device_type_slug=PATCH_PANEL_DEVICE_TYPE_SLUG,
                     role_slug=PATCH_PANEL_ROLE_SLUG,
                     location_id=parent_location_id,
+                    site_obj=site_obj,
                 )
             patch_panel_id = patch_panel.id if patch_panel else None
             if patch_panel_id is None:
