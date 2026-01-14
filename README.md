@@ -23,6 +23,7 @@ The scripts in this repo are task-oriented and typically follow this pattern:
 ## Included Scripts (Quick Guide)
 
 - `scripts/netboxparse.py`: Discovers switch VLANs, switchport data, and L3 interface addressing and pushes/updates Devices, Interfaces, VLANs, and IPs in NetBox (supports `DRY_RUN`).
+- `scripts/logical_mapping.py`: Builds switch-to-patch-panel-to-room cabling in NetBox from a CSV, creates missing wall jacks/patch panels/ports, and logs per-room status.
 - `scripts/Discovery+.py`: Finds target MAC addresses on switches and (optionally) moves the associated access interface to a target VLAN with safety checks and a report CSV.
 - `scripts/Discovery.py`: Earlier/less-safe MAC-to-VLAN change workflow (moves matching ports to VLAN 254).
 - `scripts/writeVLAN+.py`: Collects VLANs from each switch (`show vlan brief`) and writes them back into the source Excel workbook as a `VLANs` column.
@@ -94,6 +95,8 @@ Most scripts are self-contained and use default file paths under `database/`, `i
 
 - NetBox discovery + sync:
   - `python scripts/netboxparse.py`
+- Logical mapping (patch panels + wall jacks):
+  - `python scripts/logical_mapping.py`
 - VLAN move workflow with safety checks and reporting:
   - `python scripts/Discovery+.py`
 - Collect VLAN lists and write back to Excel:
