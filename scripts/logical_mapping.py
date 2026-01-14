@@ -30,7 +30,7 @@ WALLJACK_ROLE_SLUG = "ethernet-wall-plate"
 PATCH_PANEL_DEVICE_TYPE_SLUG = "patch-panel-48-port"
 PATCH_PANEL_ROLE_SLUG = "patch-panel-48-port"
 
-DEFAULT_PANEL_NAME_TEMPLATE = "{facility_id}-{location_code}-Patch Panel {panel_letter}"
+DEFAULT_PANEL_NAME_TEMPLATE = "{facility_id}-{location_code}-PP-{panel_letter}"
 PANEL_LOCATION_ALIASES = {
     "HALL-A": "AHall"
 }
