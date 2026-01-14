@@ -649,7 +649,7 @@ def main():
             patch_port = (row_norm.get("patch") or "").strip().upper()
             room = (row_norm.get("room") or "").strip()
             mapping = (row_norm.get("mapping") or row_norm.get("tr") or "").strip()
-            if not ip or not port_raw or not patch_port or not room:
+            if not ip or not port_raw or not patch_port:
                 log_room(room, "error", "missing required columns")
                 w.log(f"SKIP: missing required columns in row: {row}")
                 return
@@ -682,26 +682,29 @@ def main():
                 w.log(f"SKIP: no switch found with primary IP {ip}")
                 return
 
-            # 2) Ensure room location
-            loc_id = get_or_create_location(
-                w, site_id, room, parent_id=parent_location_id, site_obj=site_obj
-            )
-            if loc_id is None:
-                log_room(room, "error", "failed to create/find location")
-                w.log(f"SKIP: failed to create/find location for row: {row}")
-                return
+            # 2) Ensure room location (optional)
+            loc_id = None
+            walljack_id = None
+            if room:
+                loc_id = get_or_create_location(
+                    w, site_id, room, parent_id=parent_location_id, site_obj=site_obj
+                )
+                if loc_id is None:
+                    log_room(room, "error", "failed to create/find location")
+                    w.log(f"SKIP: failed to create/find location for row: {row}")
+                    return
 
-            # 3) Ensure wall jack device (name must equal location name)
-            walljack = get_or_create_device(
-                w,
-                name=room,
-                site_id=site_id,
-                device_type_slug=WALLJACK_DEVICE_TYPE_SLUG,
-                role_slug=WALLJACK_ROLE_SLUG,
-                location_id=loc_id,
-                site_obj=site_obj,
-            )
-            walljack_id = walljack.id if walljack else None
+                # 3) Ensure wall jack device (name must equal location name)
+                walljack = get_or_create_device(
+                    w,
+                    name=room,
+                    site_id=site_id,
+                    device_type_slug=WALLJACK_DEVICE_TYPE_SLUG,
+                    role_slug=WALLJACK_ROLE_SLUG,
+                    location_id=loc_id,
+                    site_obj=site_obj,
+                )
+                walljack_id = walljack.id if walljack else None
 
             # 4) Ensure patch panel device exists
             patch_panel = nb.dcim.devices.get(name=patch_panel_device_name)
@@ -762,10 +765,13 @@ def main():
                     strict=args.strict,
                 )
             else:
-                w.log(
-                    f"SKIP cable B: pp_rear_id={getattr(pp_rear,'id',None)} "
-                    f"wj_rear_id={getattr(wj_rear,'id',None)}"
-                )
+                if room:
+                    w.log(
+                        f"SKIP cable B: pp_rear_id={getattr(pp_rear,'id',None)} "
+                        f"wj_rear_id={getattr(wj_rear,'id',None)}"
+                    )
+                else:
+                    w.log("SKIP cable B: no room provided")
 
             log_room(room, "success")
             w.log(f"DONE: {switch.name} {switch_port} => {patch_panel_device_name} {patch_port} => {room} {patch_port}")
