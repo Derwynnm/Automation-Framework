@@ -1,3 +1,4 @@
+import sys
 import os
 import csv
 import re
@@ -9,10 +10,35 @@ import concurrent.futures
 from pathlib import Path
 import logging
 
+# Must be before local imports so `from lib.xxx import` works regardless of working directory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from netmiko import ConnectHandler
-import pynetbox
 from pynetbox.core.query import RequestError
 from dotenv import load_dotenv
+
+from lib.netbox_helpers import (
+    init as init_nb_helpers,
+    NetboxConfig,
+    nb_client,
+    normalize_key,
+    normalize_value,
+    infer_device_role_from_type,
+    get_site_tenant_id,
+    get_obj_tenant_id,
+    set_obj_tenant,
+    resolve_site_role,
+    resolve_role_mappings,
+    is_vlan1_interface,
+    dns_label,
+    build_site_map,
+    extract_facility_id_from_hostname,
+    ensure_device_in_netbox,
+    get_or_create_vlan_group,
+    ensure_vlan_in_netbox,
+    ensure_interface,
+    expand_vlan_list,
+)
 
 
 # =========================
@@ -52,13 +78,6 @@ LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 if not NETBOX_URL or not NETBOX_TOKEN:
     raise ValueError("NETBOX_URL and NETBOX_TOKEN must be set in .env")
 
-_nb_local = threading.local()
-
-
-def nb_client():
-    if not hasattr(_nb_local, "nb"):
-        _nb_local.nb = pynetbox.api(NETBOX_URL, token=NETBOX_TOKEN)
-    return _nb_local.nb
 
 def setup_logging():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -84,165 +103,6 @@ def setup_logging():
 
 
 logger = setup_logging()
-_SITE_TENANT_CACHE = {}
-
-
-# =========================
-# UTILS
-# =========================
-def strip_bom(s: str) -> str:
-    return s.lstrip("\ufeff") if isinstance(s, str) else s
-
-
-def normalize_key(k: str) -> str:
-    k = strip_bom(k.strip())
-    k = re.sub(r"\s+", " ", k)
-    return k
-
-
-def normalize_value(v):
-    if isinstance(v, str):
-        return v.strip()
-    return v
-
-
-def infer_device_role_from_type(device_type_name: str):
-    """
-    Infer a NetBox ROLE (not model, not netmiko platform).
-    Adjust to match your NetBox role slugs/names.
-    """
-    if not device_type_name:
-        return None
-    lowered = device_type_name.lower()
-    if any(x in lowered for x in ("catalyst", "switch", "9200", "9300", "9500", "35xx", "3560", "3750", "3850")):
-        return "switch"
-    return None
-
-
-def get_site_tenant_id(site):
-    if not site:
-        return None
-
-    cached = _SITE_TENANT_CACHE.get(site.id)
-    if cached is not None:
-        return cached
-
-    tenant_id = None
-    tenant = getattr(site, "tenant", None)
-    if tenant and getattr(tenant, "id", None):
-        tenant_id = tenant.id
-    else:
-        tenant_id = getattr(site, "tenant_id", None)
-
-    if tenant_id is None:
-        try:
-            refreshed = nb_client().dcim.sites.get(site.id)
-            refreshed_tenant = getattr(refreshed, "tenant", None)
-            if refreshed_tenant and getattr(refreshed_tenant, "id", None):
-                tenant_id = refreshed_tenant.id
-            else:
-                tenant_id = getattr(refreshed, "tenant_id", None)
-        except Exception:
-            pass
-
-    _SITE_TENANT_CACHE[site.id] = tenant_id
-    return tenant_id
-
-
-def get_obj_tenant_id(obj):
-    tenant = getattr(obj, "tenant", None)
-    if tenant and getattr(tenant, "id", None):
-        return tenant.id
-    return getattr(obj, "tenant_id", None)
-
-
-def set_obj_tenant(obj, tenant_id, context):
-    try:
-        obj.tenant = tenant_id
-    except AttributeError:
-        logger.info("  [TENANT SKIP] %s has no tenant field", context)
-        return False
-    return True
-
-
-def resolve_site_role(site):
-    if not site:
-        return None
-    return getattr(site, "site_role", None) or getattr(site, "role", None)
-
-
-def resolve_role_mappings(site_role):
-    if not site_role:
-        return None, None, None
-
-    role_slug = getattr(site_role, "slug", None)
-    role_name = getattr(site_role, "name", None)
-
-    device_role = None
-    vlan_role = None
-    ip_role = None
-
-    if role_slug:
-        device_role = nb_client().dcim.device_roles.get(slug=role_slug)
-        vlan_role = nb_client().ipam.vlan_roles.get(slug=role_slug)
-        ip_role = nb_client().ipam.roles.get(slug=role_slug)
-    if role_name:
-        device_role = device_role or nb_client().dcim.device_roles.get(name=role_name)
-        vlan_role = vlan_role or nb_client().ipam.vlan_roles.get(name=role_name)
-        ip_role = ip_role or nb_client().ipam.roles.get(name=role_name)
-
-    return device_role, vlan_role, ip_role
-
-
-def is_vlan1_interface(if_name: str) -> bool:
-    if not if_name:
-        return False
-    return re.match(r"^vlan\s*1$", if_name.strip(), re.IGNORECASE) is not None
-
-
-def dns_label(name: str) -> str:
-    return (name or "").split(".")[0]
-
-
-# =========================
-# SITE MAP (UPDATED)
-# =========================
-def build_site_map():
-    """
-    Build a mapping of Facility Code -> Site object.
-    This uses the NetBox Site 'facility' field (ACE, BSE, PHS, FSC, etc).
-    """
-    site_map = {}
-    for site in nb_client().dcim.sites.all():
-        facility = getattr(site, "facility", None)
-        if facility and isinstance(facility, str):
-            code = facility.strip().upper()
-            if code:
-                site_map[code] = site
-    return site_map
-
-
-def extract_facility_id_from_hostname(hostname: str, site_map: dict):
-    """
-    Extract facility code from hostname by looking for a token that matches a known facility code.
-    Example tokens come from splitting on '-', '_', '.', etc.
-    """
-    if not hostname:
-        return None
-
-    tokens = re.split(r"[^A-Za-z0-9]+", hostname.upper())
-
-    # Exact token match
-    for t in tokens:
-        if t in site_map:
-            return t
-
-    # Fallback: if the first 3 alnum chars match a code, accept it
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", hostname.upper())
-    if len(cleaned) >= 3 and cleaned[:3] in site_map:
-        return cleaned[:3]
-
-    return None
 
 
 # =========================
@@ -323,274 +183,8 @@ def load_inventory(path=DEVICE_CSV):
 
 
 # =========================
-# NETBOX HELPERS
-# =========================
-def resolve_device_type(nb_type_name: str):
-    """
-    Resolve a NetBox DeviceType from CSV-provided string.
-    Falls back to placeholder device type (unknown-catalyst-switch) if no match.
-    """
-    device_type = None
-    if nb_type_name:
-        device_type = (
-            nb_client().dcim.device_types.get(slug=nb_type_name)
-            or nb_client().dcim.device_types.get(model=nb_type_name)
-            or nb_client().dcim.device_types.get(name=nb_type_name)
-        )
-        if device_type:
-            return device_type
-
-        query = nb_type_name.strip()
-        candidates = nb_client().dcim.device_types.filter(q=query)
-        q_lower = query.lower()
-        for c in candidates:
-            for field in (c.model, c.name, c.slug):
-                if field and field.strip().lower() == q_lower:
-                    return c
-
-    return nb_client().dcim.device_types.get(slug=FALLBACK_NETBOX_DEVICE_TYPE_SLUG)
-
-
-def resolve_device_role(role_name: str):
-    role = None
-    if role_name:
-        role = nb_client().dcim.device_roles.get(slug=role_name) or nb_client().dcim.device_roles.get(name=role_name)
-        if role:
-            return role
-
-    return nb_client().dcim.device_roles.get(slug=FALLBACK_DEVICE_ROLE) or nb_client().dcim.device_roles.get(name=FALLBACK_DEVICE_ROLE)
-
-
-def ensure_device_in_netbox(dev, site, tenant_id=None, site_device_role=None):
-    nb_device = nb_client().dcim.devices.get(name=dev["name"])
-    if nb_device:
-        # update site if needed
-        desired_site_id = site.id if site else None
-        current_site_id = nb_device.site.id if nb_device.site else None
-        if desired_site_id != current_site_id:
-            if DRY_RUN:
-                logger.info("  [DRY RUN] Would update site for %s to %s", dev["name"], site.name if site else "None")
-            else:
-                nb_device.site = desired_site_id
-                nb_device.save()
-                logger.info("  [DEVICE] Updated site for %s to %s", dev["name"], site.name if site else "None")
-
-        if tenant_id is not None:
-            current_tenant_id = get_obj_tenant_id(nb_device)
-            if current_tenant_id != tenant_id:
-                if DRY_RUN:
-                    logger.info("  [DRY RUN] Would update tenant for %s", dev["name"])
-                else:
-                    if set_obj_tenant(nb_device, tenant_id, f"device {dev['name']}"):
-                        nb_device.save()
-                        logger.info("  [DEVICE] Updated tenant for %s", dev["name"])
-
-        if site_device_role:
-            current_role_id = nb_device.device_role.id if nb_device.device_role else None
-            if current_role_id != site_device_role.id:
-                if DRY_RUN:
-                    logger.info("  [DRY RUN] Would update role for %s to %s", dev["name"], site_device_role.name)
-                else:
-                    nb_device.device_role = site_device_role.id
-                    nb_device.role = site_device_role.id
-                    nb_device.save()
-                    logger.info("  [DEVICE] Updated role for %s to %s", dev["name"], site_device_role.name)
-        return nb_device
-
-    nb_type_name = dev.get("netbox_device_type") or dev.get("nb_device_type")
-    nb_role_name = dev.get("netbox_device_role") or dev.get("nb_device_role") or dev.get("device_role") or FALLBACK_DEVICE_ROLE
-
-    device_type = resolve_device_type(nb_type_name)
-    if not device_type:
-        raise ValueError(
-            f"DeviceType resolution failed for {dev['name']}. "
-            f"CSV type={nb_type_name!r}, fallback slug={FALLBACK_NETBOX_DEVICE_TYPE_SLUG!r} not found in NetBox."
-        )
-
-    device_role = resolve_device_role(nb_role_name)
-    if not device_role:
-        raise ValueError(
-            f"DeviceRole resolution failed for {dev['name']}. "
-            f"CSV role={nb_role_name!r}, fallback role={FALLBACK_DEVICE_ROLE!r} not found in NetBox."
-        )
-
-    if site_device_role:
-        device_role = site_device_role
-
-    if nb_type_name and device_type.slug == FALLBACK_NETBOX_DEVICE_TYPE_SLUG:
-        logger.info("  [DEVICE TYPE FALLBACK] %s: '%s' -> '%s'", dev["name"], nb_type_name, device_type.model)
-
-    if not site:
-        # Your NetBox requires site. If mapping fails, you MUST choose a strategy:
-        # 1) create a "STAGING" site and use it here, OR
-        # 2) skip the device.
-        raise ValueError(f"Site mapping failed for {dev['name']} (hostname did not contain a known Facility code).")
-
-    payload = {
-    "name": dev["name"],
-    "device_type": device_type.id,
-    "site": site.id,
-
-    # compatibility across NetBox versions/serializers
-    "device_role": device_role.id,
-    "role": device_role.id,
-    }
-    if tenant_id is not None:
-        payload["tenant"] = tenant_id
-
-    if DRY_RUN:
-        logger.info(
-            "  [DRY RUN] Would create device %s (type=%s, role=%s, site=%s)",
-            dev["name"],
-            device_type.model,
-            device_role.name,
-            site.name,
-        )
-        return None
-
-    created = nb_client().dcim.devices.create(payload)
-    logger.info(
-        "  [NEW DEVICE] Created %s (type=%s, role=%s, site=%s)",
-        dev["name"],
-        device_type.model,
-        device_role.name,
-        site.name,
-    )
-    return created
-
-
-def get_or_create_vlan_group(site, group_name):
-    group = nb_client().ipam.vlan_groups.get(name=group_name, scope_type="dcim.site", scope_id=site.id) if site else None
-
-    if not group:
-        if DRY_RUN:
-            logger.info(
-                "  [DRY RUN] Would create VLAN group '%s' for site=%s",
-                group_name,
-                site.name if site else "None",
-            )
-            return None
-        payload = {"name": group_name, "slug": group_name.lower().replace(" ", "-")}
-        if site:
-            payload["scope_type"] = "dcim.site"
-            payload["scope_id"] = site.id
-        group = nb_client().ipam.vlan_groups.create(payload)
-
-    return group
-
-
-def ensure_vlan_in_netbox(vlan, group, tenant_id=None, vlan_role_id=None):
-    if not group:
-        return None
-
-    existing = nb_client().ipam.vlans.get(vid=vlan["id"], group_id=group.id)
-    if existing:
-        changed = False
-        if existing.name != vlan["name"]:
-            existing.name = vlan["name"]
-            changed = True
-        if tenant_id is not None:
-            current_tenant_id = get_obj_tenant_id(existing)
-            if current_tenant_id != tenant_id:
-                if set_obj_tenant(existing, tenant_id, f"vlan {vlan['id']}"):
-                    changed = True
-        if vlan_role_id is not None:
-            current_role_id = existing.role.id if existing.role else None
-            if current_role_id != vlan_role_id:
-                existing.role = vlan_role_id
-                changed = True
-        if changed:
-            if DRY_RUN:
-                logger.info("  [DRY RUN] Would update VLAN %s", vlan["id"])
-            else:
-                existing.save()
-        return existing
-
-    if DRY_RUN:
-        logger.info(
-            "  [DRY RUN] Would create VLAN %s (%s) in group %s",
-            vlan["id"],
-            vlan["name"],
-            group.name,
-        )
-        return None
-
-    payload = {"vid": vlan["id"], "name": vlan["name"], "group": group.id}
-    if tenant_id is not None:
-        payload["tenant"] = tenant_id
-    if vlan_role_id is not None:
-        payload["role"] = vlan_role_id
-    return nb_client().ipam.vlans.create(payload)
-
-
-def detect_interface_type(if_name):
-    lname = if_name.lower()
-    if lname.startswith(("vlan", "loopback")):
-        return "virtual"
-    if lname.startswith(("gi", "gigabitethernet")):
-        return "1000base-t"
-    if lname.startswith(("te", "tengigabitethernet")):
-        return "10gbase-x-sfpp"
-    if lname.startswith(("twe", "twentyfivegige")):
-        return "25gbase-x-sfp28"
-    if lname.startswith(("fo", "fortygigabitethernet")):
-        return "40gbase-x-qsfpp"
-    if lname.startswith(("hu", "hundredgige")):
-        return "100gbase-x-qsfp28"
-    return "other"
-
-
-def ensure_interface(nb_device, if_name, tenant_id=None):
-    if not nb_device:
-        return None
-    nb_iface = nb_client().dcim.interfaces.get(device_id=nb_device.id, name=if_name)
-    if nb_iface:
-        if tenant_id is not None:
-            current_tenant_id = get_obj_tenant_id(nb_iface)
-            if current_tenant_id != tenant_id:
-                if DRY_RUN:
-                    logger.info("  [DRY RUN] Would update tenant for interface %s", if_name)
-                else:
-                    if set_obj_tenant(nb_iface, tenant_id, f"interface {if_name}"):
-                        nb_iface.save()
-                        logger.info("  [IF] Updated tenant for %s", if_name)
-        return nb_iface
-
-    iface_type = detect_interface_type(if_name)
-    if DRY_RUN:
-        logger.info("  [DRY RUN] Would create interface %s type=%s", if_name, iface_type)
-        return None
-
-    payload = {"device": nb_device.id, "name": if_name, "type": iface_type}
-    if tenant_id is not None:
-        payload["tenant"] = tenant_id
-    try:
-        return nb_client().dcim.interfaces.create(payload)
-    except RequestError as e:
-        if "tenant" in str(getattr(e, "error", e)).lower() and "tenant" in payload:
-            payload.pop("tenant", None)
-            return nb_client().dcim.interfaces.create(payload)
-        raise
-
-
-# =========================
 # PARSERS
 # =========================
-def expand_vlan_list(vlan_str):
-    vlans = []
-    for chunk in vlan_str.replace(" ", "").split(","):
-        if not chunk:
-            continue
-        if "-" in chunk:
-            start, end = chunk.split("-")
-            if start.isdigit() and end.isdigit():
-                vlans.extend(range(int(start), int(end) + 1))
-        else:
-            if chunk.isdigit():
-                vlans.append(int(chunk))
-    return vlans
-
-
 def parse_vlans(vlan_output):
     vlans = []
     for line in vlan_output.splitlines():
@@ -808,20 +402,14 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
             if DRY_RUN:
                 logger.info(
                     "  [DRY RUN] Would update %s: mode=%s, untagged=%s, tagged=%s",
-                    if_name,
-                    desired_mode,
-                    desired_untagged_vlan_id,
-                    desired_tagged_vlan_ids,
+                    if_name, desired_mode, desired_untagged_vlan_id, desired_tagged_vlan_ids,
                 )
             else:
                 try:
                     nb_iface.save()
                     logger.info(
                         "  [IF] Updated %s: mode=%s, untagged=%s, tagged=%s",
-                        if_name,
-                        desired_mode,
-                        desired_untagged_vlan_id,
-                        desired_tagged_vlan_ids,
+                        if_name, desired_mode, desired_untagged_vlan_id, desired_tagged_vlan_ids,
                     )
                 except RequestError as e:
                     logger.error("  [IF] NetBox rejected %s: %s", if_name, getattr(e, "error", e))
@@ -914,6 +502,18 @@ def push_device_to_netbox(dev, site, facility_id, vlan_output, swp_output, ip_ou
 # =========================
 def main():
     devices = load_inventory()
+
+    config = NetboxConfig(
+        netbox_url=NETBOX_URL,
+        netbox_token=NETBOX_TOKEN,
+        dry_run=DRY_RUN,
+        inherit_site_tenant=INHERIT_SITE_TENANT,
+        inherit_site_role=INHERIT_SITE_ROLE,
+        fallback_device_type_slug=FALLBACK_NETBOX_DEVICE_TYPE_SLUG,
+        fallback_device_role=FALLBACK_DEVICE_ROLE,
+    )
+    init_nb_helpers(config, logger)
+
     site_map = build_site_map()
 
     logger.info(
@@ -937,7 +537,6 @@ def main():
                 facility_id = extract_facility_id_from_hostname(dev.get("name", ""), site_map)
                 site = site_map.get(facility_id)
 
-                # Debug to confirm mapping works
                 logger.info(
                     "[SITE MAP] %s -> facility_id=%s -> site=%s",
                     dev["name"],

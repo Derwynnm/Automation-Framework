@@ -4,6 +4,8 @@ venv/
 
 # Environment variables
 .env
+.claude
+
 
 # Python cache
 __pycache__/
