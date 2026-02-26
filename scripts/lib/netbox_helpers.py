@@ -437,12 +437,17 @@ def _sync_device_custom_fields(nb_device, device_name, software_version, dnac_de
         )
         return
 
-    try:
-        for k, v in custom_updates.items():
+    for k, v in custom_updates.items():
+        try:
             nb_device.custom_fields[k] = v
-        nb_device.save()
-    except Exception as e:
-        _logger.warning("  [CUSTOM FIELD] Failed to update custom fields for %s: %s", device_name, e)
+            nb_device.save()
+        except Exception as e:
+            _logger.warning("  [CUSTOM FIELD] Skipping field '%s' for %s: %s", k, device_name, e)
+            # Roll back the dirty field so it doesn't bleed into later saves
+            try:
+                nb_device.custom_fields.pop(k, None)
+            except Exception:
+                pass
 
 
 # =========================

@@ -61,7 +61,7 @@ from lib.dnac_client import DNACClient, DNACConfig
 # True  → preview mode: logs everything, writes nothing.
 # False → live mode:    syncs devices, VLANs, interfaces, IPs, and cables.
 # =========================
-DRY_RUN = True
+DRY_RUN = False
 
 
 # =========================
@@ -491,8 +491,11 @@ def push_device_to_netbox_from_dnac(item: dict, site, facility_id: str, logger):
                     existing.dns_name = want_dns
                     changed = True
             if changed and not DRY_RUN:
-                existing.save()
-                logger.info("  [IP] Updated %s on %s", cidr, if_name)
+                try:
+                    existing.save()
+                    logger.info("  [IP] Updated %s on %s", cidr, if_name)
+                except Exception as e:
+                    logger.warning("  [IP] Could not update %s on %s: %s", cidr, if_name, e)
 
             if _is_primary_interface(dev, if_name) and ":" not in cidr:
                 if DRY_RUN:
@@ -501,9 +504,11 @@ def push_device_to_netbox_from_dnac(item: dict, site, facility_id: str, logger):
                     current_primary = getattr(nb_device, "primary_ip4", None)
                     current_primary_id = current_primary.id if current_primary else None
                     if current_primary_id != existing.id:
-                        nb_device.primary_ip4 = existing.id
-                        nb_device.save()
-                        logger.info("  [DEVICE] Set primary IPv4 for %s to %s", dev["name"], cidr)
+                        try:
+                            nb_client().dcim.devices.update([{"id": nb_device.id, "primary_ip4": existing.id}])
+                            logger.info("  [DEVICE] Set primary IPv4 for %s to %s", dev["name"], cidr)
+                        except Exception as e:
+                            logger.warning("  [DEVICE] Could not set primary IPv4 for %s to %s: %s", dev["name"], cidr, e)
             continue
 
         if DRY_RUN:
@@ -527,9 +532,11 @@ def push_device_to_netbox_from_dnac(item: dict, site, facility_id: str, logger):
                 current_primary = getattr(nb_device, "primary_ip4", None)
                 current_primary_id = current_primary.id if current_primary else None
                 if current_primary_id != created.id:
-                    nb_device.primary_ip4 = created.id
-                    nb_device.save()
-                    logger.info("  [DEVICE] Set primary IPv4 for %s to %s", dev["name"], cidr)
+                    try:
+                        nb_client().dcim.devices.update([{"id": nb_device.id, "primary_ip4": created.id}])
+                        logger.info("  [DEVICE] Set primary IPv4 for %s to %s", dev["name"], cidr)
+                    except Exception as e:
+                        logger.warning("  [DEVICE] Could not set primary IPv4 for %s to %s: %s", dev["name"], cidr, e)
 
 
 # =========================
@@ -584,10 +591,18 @@ def sync_topology(dnac: DNACClient, logger):
             skipped_missing += 1
             continue
 
-        src_results = list(nb.dcim.devices.filter(name=src_hostname))
-        src_device = src_results[0] if src_results else None
-        tgt_results = list(nb.dcim.devices.filter(name=tgt_hostname))
-        tgt_device = tgt_results[0] if tgt_results else None
+        try:
+            src_results = list(nb.dcim.devices.filter(name=src_hostname))
+            src_device = src_results[0] if src_results else None
+            tgt_results = list(nb.dcim.devices.filter(name=tgt_hostname))
+            tgt_device = tgt_results[0] if tgt_results else None
+        except Exception as e:
+            logger.warning(
+                "  [CABLE SKIP] NetBox API error looking up %s <-> %s: %s",
+                src_hostname, tgt_hostname, e,
+            )
+            skipped_missing += 1
+            continue
 
         if not src_device or not tgt_device:
             missing = [h for h, d in [(src_hostname, src_device), (tgt_hostname, tgt_device)] if not d]
