@@ -82,7 +82,7 @@ INHERIT_SITE_TENANT = os.getenv("INHERIT_SITE_TENANT", "true").strip().lower() i
 INHERIT_SITE_ROLE = os.getenv("INHERIT_SITE_ROLE", "true").strip().lower() in ("1", "true", "yes", "y")
 
 FALLBACK_NETBOX_DEVICE_TYPE_SLUG = os.getenv("FALLBACK_NETBOX_DEVICE_TYPE_SLUG", "unknown-catalyst-switch")
-FALLBACK_DEVICE_ROLE = os.getenv("FALLBACK_DEVICE_ROLE", "switch")
+FALLBACK_DEVICE_ROLE = os.getenv("FALLBACK_DEVICE_ROLE", "access-switch")
 
 DNAC_BASE_URL = os.getenv("DNAC_BASE_URL", "").rstrip("/")
 DNAC_USERNAME = os.getenv("DNAC_USERNAME") or os.getenv("username")
@@ -91,6 +91,15 @@ DNAC_VERIFY_SSL = os.getenv("DNAC_VERIFY_SSL", "false").strip().lower() in ("1",
 DNAC_PAGE_SIZE = int(os.getenv("DNAC_PAGE_SIZE", "500"))
 
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
+
+# Some sites have switches prefixed with a building number instead of (or in addition to)
+# the facility letter code.  Map the numeric prefix → the facility code used in NetBox.
+# e.g. "400-SomeSwitch" → facility_id "ADM" → site_map["ADM"]
+_HOSTNAME_PREFIX_ALIASES: dict[str, str] = {
+    "400": "ADM",
+    "410": "ABC",
+    "420": "ANN",
+}
 
 if not NETBOX_URL or not NETBOX_TOKEN:
     raise ValueError("NETBOX_URL and NETBOX_TOKEN must be set in .env")
@@ -168,7 +177,7 @@ def _transform_device(dnac_device: dict) -> dict:
         "name": dnac_device.get("hostname", ""),
         "host": dnac_device.get("managementIpAddress", ""),
         "netbox_device_type": dnac_device.get("platformId", ""),
-        "device_role": "switch",
+        "device_role": "distribution-switch" if (dnac_device.get("platformId") or "").upper().startswith(("C9300", "C9500")) else "access-switch",
         # DNAC-specific extras passed as kwargs to ensure_device_in_netbox
         "_serial": primary_serial,
         "_software_version": dnac_device.get("softwareVersion") or None,
@@ -214,6 +223,15 @@ def _normalize_if_name(name: str) -> str:
         if name.startswith(full):
             return abbrev + name[len(full):]
     return name
+
+
+def _is_primary_interface(dev: dict, if_name: str) -> bool:
+    """Return True if this interface's IP should be set as the device's primary IPv4.
+    C9300* platforms use Loopback0 as management; everything else uses Vlan1."""
+    platform = (dev.get("netbox_device_type") or "").upper()
+    if platform.startswith("C9300"):
+        return if_name.lower() == "loopback0"
+    return is_vlan1_interface(if_name)
 
 
 # Prefixes whose interfaces should be skipped entirely (not physical switchports)
@@ -438,7 +456,8 @@ def push_device_to_netbox_from_dnac(item: dict, site, facility_id: str, logger):
         if not nb_iface and DRY_RUN:
             continue
 
-        existing = nb_client().ipam.ip_addresses.get(address=cidr)
+        ip_results = list(nb_client().ipam.ip_addresses.filter(address=cidr))
+        existing = ip_results[0] if ip_results else None
         if existing:
             changed = False
             if existing.assigned_object_type != "dcim.interface" or existing.assigned_object_id != nb_iface.id:
@@ -475,7 +494,7 @@ def push_device_to_netbox_from_dnac(item: dict, site, facility_id: str, logger):
                 existing.save()
                 logger.info("  [IP] Updated %s on %s", cidr, if_name)
 
-            if is_vlan1_interface(if_name) and ":" not in cidr:
+            if _is_primary_interface(dev, if_name) and ":" not in cidr:
                 if DRY_RUN:
                     logger.info("  [DRY RUN] Would set primary IPv4 for %s to %s", dev["name"], cidr)
                 else:
@@ -504,7 +523,7 @@ def push_device_to_netbox_from_dnac(item: dict, site, facility_id: str, logger):
                 payload["dns_name"] = want_dns
             created = nb_client().ipam.ip_addresses.create(payload)
             logger.info("  [IP] Created %s on %s", cidr, if_name)
-            if created and is_vlan1_interface(if_name) and ":" not in cidr:
+            if created and _is_primary_interface(dev, if_name) and ":" not in cidr:
                 current_primary = getattr(nb_device, "primary_ip4", None)
                 current_primary_id = current_primary.id if current_primary else None
                 if current_primary_id != created.id:
@@ -549,8 +568,8 @@ def sync_topology(dnac: DNACClient, logger):
     for link in links:
         src_id = link.get("source") or link.get("sourceNodeId") or ""
         tgt_id = link.get("target") or link.get("targetNodeId") or ""
-        src_port = (link.get("startPortName") or "").strip()
-        tgt_port = (link.get("endPortName") or "").strip()
+        src_port = _normalize_if_name((link.get("startPortName") or "").strip())
+        tgt_port = _normalize_if_name((link.get("endPortName") or "").strip())
 
         if not all([src_id, tgt_id, src_port, tgt_port]):
             continue
@@ -565,8 +584,10 @@ def sync_topology(dnac: DNACClient, logger):
             skipped_missing += 1
             continue
 
-        src_device = nb.dcim.devices.get(name=src_hostname)
-        tgt_device = nb.dcim.devices.get(name=tgt_hostname)
+        src_results = list(nb.dcim.devices.filter(name=src_hostname))
+        src_device = src_results[0] if src_results else None
+        tgt_results = list(nb.dcim.devices.filter(name=tgt_hostname))
+        tgt_device = tgt_results[0] if tgt_results else None
 
         if not src_device or not tgt_device:
             missing = [h for h, d in [(src_hostname, src_device), (tgt_hostname, tgt_device)] if not d]
@@ -711,6 +732,10 @@ def main():
 
                 dev = item["dev"]
                 facility_id = extract_facility_id_from_hostname(dev.get("name", ""), site_map)
+                if not facility_id:
+                    # Try numeric-prefix alias (e.g. "400-Switch" → "ADM")
+                    prefix = re.split(r"[^A-Za-z0-9]", dev.get("name", "").upper())[0]
+                    facility_id = _HOSTNAME_PREFIX_ALIASES.get(prefix)
                 site = site_map.get(facility_id)
 
                 logger.info(

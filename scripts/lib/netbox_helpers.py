@@ -30,7 +30,7 @@ class NetboxConfig:
     inherit_site_tenant: bool = True
     inherit_site_role: bool = True
     fallback_device_type_slug: str = "unknown-catalyst-switch"
-    fallback_device_role: str = "switch"
+    fallback_device_role: str = "access-switch"
 
 
 _cfg = None
@@ -247,11 +247,10 @@ def resolve_device_type(nb_type_name: str):
     """Resolve a NetBox DeviceType; falls back to fallback_device_type_slug."""
     device_type = None
     if nb_type_name:
-        device_type = (
-            nb_client().dcim.device_types.get(slug=nb_type_name)
-            or nb_client().dcim.device_types.get(model=nb_type_name)
-            or nb_client().dcim.device_types.get(name=nb_type_name)
-        )
+        _dt_by_slug  = nb_client().dcim.device_types.get(slug=nb_type_name)
+        _dt_by_model = next(iter(nb_client().dcim.device_types.filter(model=nb_type_name)), None)
+        _dt_by_name  = next(iter(nb_client().dcim.device_types.filter(name=nb_type_name)), None)
+        device_type = _dt_by_slug or _dt_by_model or _dt_by_name
         if device_type:
             return device_type
 
@@ -263,7 +262,7 @@ def resolve_device_type(nb_type_name: str):
                 if field and field.strip().lower() == q_lower:
                     return c
 
-    return nb_client().dcim.device_types.get(slug=_cfg.fallback_device_type_slug)
+    return next(iter(nb_client().dcim.device_types.filter(slug=_cfg.fallback_device_type_slug)), None)
 
 
 def resolve_device_role(role_name: str):
@@ -271,14 +270,14 @@ def resolve_device_role(role_name: str):
     if role_name:
         role = (
             nb_client().dcim.device_roles.get(slug=role_name)
-            or nb_client().dcim.device_roles.get(name=role_name)
+            or next(iter(nb_client().dcim.device_roles.filter(name=role_name)), None)
         )
         if role:
             return role
 
     return (
         nb_client().dcim.device_roles.get(slug=_cfg.fallback_device_role)
-        or nb_client().dcim.device_roles.get(name=_cfg.fallback_device_role)
+        or next(iter(nb_client().dcim.device_roles.filter(name=_cfg.fallback_device_role)), None)
     )
 
 
