@@ -303,6 +303,22 @@ def ensure_device_in_netbox(
     else:
         results = list(nb_client().dcim.devices.filter(name=dev["name"]))
     nb_device = results[0] if results else None
+
+    # Secondary lookup: strip domain suffix and try case-insensitive match.
+    # Handles FQDN-vs-short-name mismatches (e.g. DNAC "ACM-AHALL.risd.net" vs NetBox "ACM-AHall").
+    if not nb_device and "." in dev["name"]:
+        short_name = dev["name"].split(".")[0]
+        if site:
+            results = list(nb_client().dcim.devices.filter(name__ie=short_name, site_id=site.id))
+        else:
+            results = list(nb_client().dcim.devices.filter(name__ie=short_name))
+        if results:
+            nb_device = results[0]
+            _logger.info(
+                "  [DEVICE] Matched %r to existing device %r via short hostname",
+                dev["name"], nb_device.name,
+            )
+
     if nb_device:
         # Update site if needed
         desired_site_id = site.id if site else None
@@ -365,6 +381,19 @@ def ensure_device_in_netbox(
     )
 
     device_type = resolve_device_type(nb_type_name)
+    # If platformId resolved to the fallback type, try the DNAC human-readable type string as a
+    # second attempt (e.g. "Cisco Catalyst 9200L 48-port PoE+ Switch" often matches better than
+    # a raw platformId like "C9200L-48P-4G").
+    if device_type and _cfg.fallback_device_type_slug and device_type.slug == _cfg.fallback_device_type_slug:
+        dnac_type_hint = dev.get("_dnac_type") or ""
+        if dnac_type_hint:
+            better = resolve_device_type(dnac_type_hint)
+            if better and better.slug != _cfg.fallback_device_type_slug:
+                _logger.info(
+                    "  [DEVICE TYPE] %s: platformId %r → fallback; using DNAC type %r → %s",
+                    dev["name"], nb_type_name, dnac_type_hint, better.model,
+                )
+                device_type = better
     if not device_type:
         raise ValueError(
             f"DeviceType resolution failed for {dev['name']}. "

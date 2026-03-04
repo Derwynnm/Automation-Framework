@@ -177,6 +177,7 @@ def _transform_device(dnac_device: dict) -> dict:
         "name": dnac_device.get("hostname", ""),
         "host": dnac_device.get("managementIpAddress", ""),
         "netbox_device_type": dnac_device.get("platformId", ""),
+        "_dnac_type": dnac_device.get("type") or "",  # human-readable type, used as fallback for device type resolution
         "device_role": "distribution-switch" if (dnac_device.get("platformId") or "").upper().startswith(("C9300", "C9500")) else "access-switch",
         # DNAC-specific extras passed as kwargs to ensure_device_in_netbox
         "_serial": primary_serial,
@@ -724,6 +725,17 @@ def main():
         if d.get("reachabilityStatus", "") != "Reachable":
             continue
         if args.hostname and d.get("hostname", "") != args.hostname:
+            continue
+        # Explicitly skip APs and wireless devices regardless of family filter
+        _platform = (d.get("platformId") or "").upper()
+        _family   = (d.get("family") or "").lower()
+        _dtype    = (d.get("type") or "").lower()
+        if (
+            _family in ("access points", "unified ap", "wireless lan controller")
+            or "access point" in _dtype
+            or _platform.startswith(("AIR-", "C9100", "C9105", "C9115", "C9120", "C9130", "C9136"))
+        ):
+            logger.info("  [SKIP AP] %s (family=%r, platform=%r)", d.get("hostname"), d.get("family"), _platform)
             continue
         filtered.append(d)
 
