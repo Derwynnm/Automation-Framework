@@ -39,6 +39,13 @@ _logger = None
 _nb_local = threading.local()
 _SITE_TENANT_CACHE = {}
 
+# Device type slugs that are clearly wrong for Catalyst switches and should trigger the
+# _dnac_type retry path in ensure_device_in_netbox().
+_WRONG_FOR_CATALYST = frozenset({
+    "cisco-4321-isr", "cisco-4331-isr", "cisco-4351-isr", "cisco-4431-isr",
+    "cisco-4451-isr", "cisco-isr-4000",
+})
+
 
 def init(config: NetboxConfig, logger):
     """Configure the module before use. Call once from main() before spawning threads."""
@@ -245,14 +252,21 @@ def expand_vlan_list(vlan_str):
 
 def resolve_device_type(nb_type_name: str):
     """Resolve a NetBox DeviceType; falls back to fallback_device_type_slug."""
-    device_type = None
     if nb_type_name:
-        _dt_by_slug  = nb_client().dcim.device_types.get(slug=nb_type_name)
+        _dt_by_slug = nb_client().dcim.device_types.get(slug=nb_type_name)
+        if _dt_by_slug:
+            _logger.info("  [RESOLVE_DT] %r matched via slug → %s", nb_type_name, _dt_by_slug.slug)
+            return _dt_by_slug
+
         _dt_by_model = next(iter(nb_client().dcim.device_types.filter(model=nb_type_name)), None)
-        _dt_by_name  = next(iter(nb_client().dcim.device_types.filter(name=nb_type_name)), None)
-        device_type = _dt_by_slug or _dt_by_model or _dt_by_name
-        if device_type:
-            return device_type
+        if _dt_by_model:
+            _logger.info("  [RESOLVE_DT] %r matched via model → %s", nb_type_name, _dt_by_model.slug)
+            return _dt_by_model
+
+        _dt_by_name = next(iter(nb_client().dcim.device_types.filter(name=nb_type_name)), None)
+        if _dt_by_name:
+            _logger.info("  [RESOLVE_DT] %r matched via name → %s", nb_type_name, _dt_by_name.slug)
+            return _dt_by_name
 
         query = nb_type_name.strip()
         candidates = nb_client().dcim.device_types.filter(q=query)
@@ -260,9 +274,14 @@ def resolve_device_type(nb_type_name: str):
         for c in candidates:
             for field in (c.model, c.name, c.slug):
                 if field and field.strip().lower() == q_lower:
+                    _logger.info("  [RESOLVE_DT] %r matched via q-exact field=%r → %s", nb_type_name, field, c.slug)
                     return c
+        _logger.info("  [RESOLVE_DT] %r no match → falling back to slug=%r", nb_type_name, _cfg.fallback_device_type_slug)
 
-    return next(iter(nb_client().dcim.device_types.filter(slug=_cfg.fallback_device_type_slug)), None)
+    result = next(iter(nb_client().dcim.device_types.filter(slug=_cfg.fallback_device_type_slug)), None)
+    if result:
+        _logger.info("  [RESOLVE_DT] fallback resolved → %s", result.slug)
+    return result
 
 
 def resolve_device_role(role_name: str):
@@ -304,14 +323,17 @@ def ensure_device_in_netbox(
         results = list(nb_client().dcim.devices.filter(name=dev["name"]))
     nb_device = results[0] if results else None
 
-    # Secondary lookup: strip domain suffix and try case-insensitive match.
-    # Handles FQDN-vs-short-name mismatches (e.g. DNAC "ACM-AHALL.risd.net" vs NetBox "ACM-AHall").
+    # Secondary lookup: strip domain suffix and try case-insensitive starts-with match.
+    # Handles FQDN-vs-short-name and different-domain mismatches, e.g.:
+    #   DNAC "ACM-AHALL.risd.net"      vs NetBox "ACM-AHall"          (short name)
+    #   DNAC "BHS9500.ridns1.risd.org" vs NetBox "BHS9500.risd.net"   (different domain suffix)
+    # name__isw matches any NetBox name that starts with the first hostname label.
     if not nb_device and "." in dev["name"]:
         short_name = dev["name"].split(".")[0]
         if site:
-            results = list(nb_client().dcim.devices.filter(name__ie=short_name, site_id=site.id))
+            results = list(nb_client().dcim.devices.filter(name__isw=short_name, site_id=site.id))
         else:
-            results = list(nb_client().dcim.devices.filter(name__ie=short_name))
+            results = list(nb_client().dcim.devices.filter(name__isw=short_name))
         if results:
             nb_device = results[0]
             _logger.info(
@@ -380,20 +402,31 @@ def ensure_device_in_netbox(
         or _cfg.fallback_device_role
     )
 
+    _logger.info(
+        "  [DEVICE TYPE] Resolving for %s: platformId=%r  dnac_type=%r",
+        dev["name"], nb_type_name, dev.get("_dnac_type"),
+    )
     device_type = resolve_device_type(nb_type_name)
-    # If platformId resolved to the fallback type, try the DNAC human-readable type string as a
-    # second attempt (e.g. "Cisco Catalyst 9200L 48-port PoE+ Switch" often matches better than
-    # a raw platformId like "C9200L-48P-4G").
-    if device_type and _cfg.fallback_device_type_slug and device_type.slug == _cfg.fallback_device_type_slug:
-        dnac_type_hint = dev.get("_dnac_type") or ""
-        if dnac_type_hint:
-            better = resolve_device_type(dnac_type_hint)
-            if better and better.slug != _cfg.fallback_device_type_slug:
-                _logger.info(
-                    "  [DEVICE TYPE] %s: platformId %r → fallback; using DNAC type %r → %s",
-                    dev["name"], nb_type_name, dnac_type_hint, better.model,
-                )
-                device_type = better
+    if device_type:
+        _logger.info("  [DEVICE TYPE] %s resolved platformId=%r → model=%r slug=%r", dev["name"], nb_type_name, device_type.model, device_type.slug)
+    # If platformId resolved to the fallback type OR a known wrong type (e.g. an ISR router),
+    # retry with the DNAC human-readable type string — it often matches NetBox model names better
+    # than a raw platformId (e.g. "Cisco Catalyst 9200CX-12P-2X2G Switch" vs "C9200CX-12P-2X2G").
+    if device_type:
+        _is_wrong = (
+            (_cfg.fallback_device_type_slug and device_type.slug == _cfg.fallback_device_type_slug)
+            or device_type.slug in _WRONG_FOR_CATALYST
+        )
+        if _is_wrong:
+            dnac_type_hint = dev.get("_dnac_type") or ""
+            if dnac_type_hint:
+                better = resolve_device_type(dnac_type_hint)
+                if better and better.slug != _cfg.fallback_device_type_slug and better.slug not in _WRONG_FOR_CATALYST:
+                    _logger.info(
+                        "  [DEVICE TYPE] %s: platformId %r → wrong type %r; retried with DNAC type %r → %s",
+                        dev["name"], nb_type_name, device_type.slug, dnac_type_hint, better.model,
+                    )
+                    device_type = better
     if not device_type:
         raise ValueError(
             f"DeviceType resolution failed for {dev['name']}. "
@@ -410,7 +443,10 @@ def ensure_device_in_netbox(
     if site_device_role:
         device_role = site_device_role
 
-    if nb_type_name and device_type.slug == _cfg.fallback_device_type_slug:
+    if nb_type_name and (
+        device_type.slug == _cfg.fallback_device_type_slug
+        or device_type.slug in _WRONG_FOR_CATALYST
+    ):
         _logger.info("  [DEVICE TYPE FALLBACK] %s: '%s' -> '%s'", dev["name"], nb_type_name, device_type.model)
 
     if not site:

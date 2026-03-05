@@ -173,12 +173,18 @@ def _transform_device(dnac_device: dict) -> dict:
     primary_serial = serials[0] if serials else ""
     stack_serials_str = serials_raw if len(serials) > 1 else None
 
+    platform_id = (dnac_device.get("platformId") or "").strip()
+    # DNAC returns comma-separated platformId for switch stacks (one per stack member).
+    # Take the first token; all members are the same model in homogeneous stacks.
+    if "," in platform_id:
+        platform_id = platform_id.split(",")[0].strip()
+
     return {
         "name": dnac_device.get("hostname", ""),
         "host": dnac_device.get("managementIpAddress", ""),
-        "netbox_device_type": dnac_device.get("platformId", ""),
+        "netbox_device_type": platform_id,
         "_dnac_type": dnac_device.get("type") or "",  # human-readable type, used as fallback for device type resolution
-        "device_role": "distribution-switch" if (dnac_device.get("platformId") or "").upper().startswith(("C9300", "C9500")) else "access-switch",
+        "device_role": "distribution-switch" if platform_id.upper().startswith(("C9300", "C9500")) else "access-switch",
         # DNAC-specific extras passed as kwargs to ensure_device_in_netbox
         "_serial": primary_serial,
         "_software_version": dnac_device.get("softwareVersion") or None,
@@ -611,8 +617,16 @@ def sync_topology(dnac: DNACClient, logger):
             skipped_missing += 1
             continue
 
-        src_iface = nb.dcim.interfaces.get(device_id=src_device.id, name=src_port)
-        tgt_iface = nb.dcim.interfaces.get(device_id=tgt_device.id, name=tgt_port)
+        try:
+            src_iface = nb.dcim.interfaces.get(device_id=src_device.id, name=src_port)
+            tgt_iface = nb.dcim.interfaces.get(device_id=tgt_device.id, name=tgt_port)
+        except Exception as e:
+            logger.warning(
+                "  [CABLE SKIP] NetBox API error looking up interfaces %s/%s <-> %s/%s: %s",
+                src_hostname, src_port, tgt_hostname, tgt_port, e,
+            )
+            skipped_missing += 1
+            continue
 
         if not src_iface or not tgt_iface:
             missing = [
