@@ -263,10 +263,10 @@ def resolve_device_type(nb_type_name: str):
             _logger.info("  [RESOLVE_DT] %r matched via model → %s", nb_type_name, _dt_by_model.slug)
             return _dt_by_model
 
-        _dt_by_name = next(iter(nb_client().dcim.device_types.filter(name=nb_type_name)), None)
-        if _dt_by_name:
-            _logger.info("  [RESOLVE_DT] %r matched via name → %s", nb_type_name, _dt_by_name.slug)
-            return _dt_by_name
+        # NOTE: dcim.device_types has no 'name' filter — the correct field is 'model'.
+        # filter(name=...) would be silently ignored by NetBox and return all device types,
+        # causing next(iter()) to return the alphabetically-first record (usually "4431 ISR").
+        # Step 3 removed; q-search below covers the free-text case correctly.
 
         query = nb_type_name.strip()
         candidates = nb_client().dcim.device_types.filter(q=query)

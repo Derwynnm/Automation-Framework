@@ -99,6 +99,23 @@ _HOSTNAME_PREFIX_ALIASES: dict[str, str] = {
     "400": "ADM",
     "410": "ABC",
     "420": "ANN",
+    "FMJ": "FMM",   # FMJ building belongs to the FMM site
+    "FMJH": "FMM",  # FMJ outdoor/hardware switches (same site)
+    "ANX" : "ANN",
+    "CTE" : "SVL",
+    "CoR" : "DC",
+    "CML" : "RSC",
+
+}
+
+# Hostname prefix substitutions applied before any NetBox lookup or create.
+# DNAC uses one naming convention; NetBox uses another for the same physical devices.
+# Checked longest-first so "FMJH" is evaluated before "FMJ".
+# e.g. DNAC "FMJ-A142.risd.net" → lookup/create as "FMM-A142.risd.net" in NetBox.
+_HOSTNAME_PREFIX_RENAMES: dict[str, str] = {
+    "FMJH": "FMM",  # FMJH_pole1_North_lot → FMM_pole1_North_lot
+    "FMJ":  "FMM",  # FMJ-A142             → FMM-A142
+    "CML":  "RSC",  # CML-MTR              → RSC-MTR
 }
 
 if not NETBOX_URL or not NETBOX_TOKEN:
@@ -243,8 +260,9 @@ def _is_primary_interface(dev: dict, if_name: str) -> bool:
 
 # Prefixes whose interfaces should be skipped entirely (not physical switchports)
 _SKIP_PREFIXES = ("loopback", "vlan", "tunnel")
-# Prefixes that cannot be access ports (port-channels: include in swp_info with mode=None)
-_NO_ACCESS_PREFIXES = ("port-channel",)
+# Prefixes that cannot be access ports — included in swp_info as mode=None shells only.
+# "ap" = AppGigabitEthernet: IOS-XE application hosting module port, not a switchport.
+_NO_ACCESS_PREFIXES = ("port-channel", "ap")
 
 
 def _transform_interfaces(dnac_interfaces: list) -> dict:
@@ -425,6 +443,9 @@ def push_device_to_netbox_from_dnac(item: dict, site, facility_id: str, logger):
 
         if desired_mode and nb_iface and nb_iface.mode != desired_mode:
             nb_iface.mode = desired_mode
+            if desired_mode == "access":
+                # Clear any stale tagged_vlans — NetBox rejects mode=access with tagged_vlans set
+                nb_iface.tagged_vlans = []
             changed = True
 
         if nb_iface:
@@ -772,11 +793,30 @@ def main():
                     return
 
                 dev = item["dev"]
+                # Translate DNAC hostname prefix to the canonical NetBox name before any lookup.
+                # Checked longest-first so FMJH is matched before FMJ.
+                _hn = dev["name"]
+                for _old, _new in sorted(_HOSTNAME_PREFIX_RENAMES.items(), key=lambda kv: -len(kv[0])):
+                    if _hn.upper().startswith(_old.upper()):
+                        dev["name"] = _new + _hn[len(_old):]
+                        logger.info("  [RENAME] %s → %s", _hn, dev["name"])
+                        break
+
                 facility_id = extract_facility_id_from_hostname(dev.get("name", ""), site_map)
+                # Apply facility code aliases for codes extracted but absent from site_map
+                # (e.g. hostname contains "FMJ" token but NetBox site has facility="FMM").
+                if facility_id and facility_id not in site_map:
+                    facility_id = _HOSTNAME_PREFIX_ALIASES.get(facility_id) or facility_id
                 if not facility_id:
-                    # Try numeric-prefix alias (e.g. "400-Switch" → "ADM")
+                    # Try exact prefix alias (e.g. "400-Switch" → "ADM")
                     prefix = re.split(r"[^A-Za-z0-9]", dev.get("name", "").upper())[0]
                     facility_id = _HOSTNAME_PREFIX_ALIASES.get(prefix)
+                    if not facility_id:
+                        # Starts-with fallback for compound prefixes (e.g. "FMJ9300" → "FMJ" → "FMM")
+                        for alias, code in _HOSTNAME_PREFIX_ALIASES.items():
+                            if prefix.startswith(alias):
+                                facility_id = code
+                                break
                 site = site_map.get(facility_id)
 
                 logger.info(
