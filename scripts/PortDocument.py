@@ -93,7 +93,7 @@ def main() -> None:
     ip_jobs: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for _, row in df.iterrows():
         ip = str(row["IP Address"]).strip()
-        desc = str(row["Description"]).strip()
+        desc = "" if pd.isna(row["Description"]) else str(row["Description"]).strip()
         for port in str(row["Port"]).split(","):
             port = port.strip()
             if port:
