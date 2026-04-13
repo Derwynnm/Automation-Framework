@@ -12,14 +12,14 @@ env_path = Path(__file__).resolve().parents[1] / ".env"  # go up to repo root
 load_dotenv(env_path)
 
 # ----- Calling .env
-username = os.getenv("username")
-password = os.getenv("password")
-secret = os.getenv("secret")
+username = os.getenv("NET_USERNAME")
+password = os.getenv("NET_PASSWORD")
+secret = os.getenv("NET_SECRET")
 
 # Configuration
 
 THREADS = 10  # Adjust this to tune parallelism
-FILE_PATH = Path(__file__).resolve().parents[1] / "database" / "MTE.xlsx"  # Excel input
+FILE_PATH = Path(__file__).resolve().parents[1] / "database" / "NRE.xlsx"  # Excel input
 SSH_TIMEOUT = 60  # Seconds before an SSH attempt times out
 LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "port_description_log.txt"  # Log file name
 
