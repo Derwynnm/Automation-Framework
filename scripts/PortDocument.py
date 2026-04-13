@@ -1,7 +1,7 @@
 import pandas as pd
 from netmiko import ConnectHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from time import sleep
+from collections import defaultdict
 import logging
 
 from dotenv import load_dotenv
@@ -32,8 +32,8 @@ logging.basicConfig(
 
 # Worker function – runs in its own thread
 
-def configure_port_description(switch_ip: str, ports: list[str], description: str) -> str:
-    """Connects to a Cisco IOS device, applies a description to each interface, and returns a short status string."""
+def configure_port_description(switch_ip: str, port_desc_pairs: list[tuple[str, str]]) -> str:
+    """Connects to a Cisco IOS device, applies descriptions to all interfaces in one session, and returns a short status string."""
 
     device = {
         "device_type": "cisco_ios",
@@ -42,7 +42,7 @@ def configure_port_description(switch_ip: str, ports: list[str], description: st
         "password": password,
         "secret": secret if secret else None,
         "conn_timeout": SSH_TIMEOUT,
-        "global_delay_factor": 1,
+        "fast_cli": True,
         "verbose": False,
     }
 
@@ -50,28 +50,24 @@ def configure_port_description(switch_ip: str, ports: list[str], description: st
         with ConnectHandler(**device) as net_connect:
             net_connect.enable()
 
-            for port in ports:
-                port = port.strip()
+            cmds = []
+            skipped = []
+            for port, description in port_desc_pairs:
                 if port.lower().startswith(('po', 'twe')):
+                    skipped.append(port)
                     logging.info(f"Skipped {port} on {switch_ip} (Port-Channel or Twe)")
                     continue
-                cmd_set = [
-                    f"interface {port}",
-                    f"description {description}",
-                ]
-                
-                response = net_connect.send_config_set(cmd_set, cmd_verify=False)
+                cmds.extend([f"interface {port}", f"description {description}"])
 
-                # Check for potential issues in the response
+            configured = len(port_desc_pairs) - len(skipped)
+            if cmds:
+                response = net_connect.send_config_set(cmds, cmd_verify=False)
                 if "% Invalid input" in response or "% Incomplete" in response or "% Ambiguous" in response:
-                    logging.warning(f"Potential issue with port {port} on {switch_ip}: {response.strip()}")
+                    logging.warning(f"Potential issue on {switch_ip}: {response.strip()}")
                 else:
-                    logging.info(f"Configured {port} on {switch_ip}")
-                
-                net_connect.find_prompt()
-                sleep(0.5)
-            
-        result = f"SUCCESS: {switch_ip} ({len(ports)} ports)"
+                    logging.info(f"Configured {configured} port(s) on {switch_ip}")
+
+        result = f"SUCCESS: {switch_ip} ({configured} ports)"
         logging.info(result)
         return result
 
@@ -91,17 +87,20 @@ def read_excel(file_path: str) -> pd.DataFrame:
 def main() -> None:
     df = read_excel(FILE_PATH)
 
-    # Build job list for executor
-    jobs = []
-    with ThreadPoolExecutor(max_workers=min(THREADS, len(df))) as pool:
-        for _, row in df.iterrows():
-            ip = row["IP Address"]
-            ports = [p.strip() for p in str(row["Port"]).split(",") if p.strip()]
-            desc = row["Description"]
-            jobs.append(pool.submit(configure_port_description, ip, ports, desc))
+    # Group all (port, description) pairs by IP so each device gets exactly one SSH connection
+    ip_jobs: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for _, row in df.iterrows():
+        ip = str(row["IP Address"]).strip()
+        desc = str(row["Description"]).strip()
+        for port in str(row["Port"]).split(","):
+            port = port.strip()
+            if port:
+                ip_jobs[ip].append((port, desc))
 
-        # As jobs finish, print their status lines
-        for future in as_completed(jobs):
+    with ThreadPoolExecutor(max_workers=min(THREADS, len(ip_jobs))) as pool:
+        futures = {pool.submit(configure_port_description, ip, pairs): ip
+                   for ip, pairs in ip_jobs.items()}
+        for future in as_completed(futures):
             print(future.result())
 
 if __name__ == "__main__":
