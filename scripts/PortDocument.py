@@ -42,7 +42,6 @@ def configure_port_description(switch_ip: str, port_desc_pairs: list[tuple[str, 
         "password": password,
         "secret": secret if secret else None,
         "conn_timeout": SSH_TIMEOUT,
-        "fast_cli": True,
         "verbose": False,
     }
 
@@ -57,11 +56,14 @@ def configure_port_description(switch_ip: str, port_desc_pairs: list[tuple[str, 
                     skipped.append(port)
                     logging.info(f"Skipped {port} on {switch_ip} (Port-Channel or Twe)")
                     continue
-                cmds.extend([f"interface {port}", f"description {description}"])
+                if description:
+                    cmds.extend([f"interface {port}", f"description {description}"])
+                else:
+                    cmds.extend([f"interface {port}", "no description"])
 
             configured = len(port_desc_pairs) - len(skipped)
             if cmds:
-                response = net_connect.send_config_set(cmds, cmd_verify=False)
+                response = net_connect.send_config_set(cmds, cmd_verify=False, read_timeout=120)
                 if "% Invalid input" in response or "% Incomplete" in response or "% Ambiguous" in response:
                     logging.warning(f"Potential issue on {switch_ip}: {response.strip()}")
                 else:
