@@ -10,9 +10,9 @@ env_path = Path(__file__).resolve().parents[1] / ".env"  # go up to repo root
 load_dotenv(env_path)
 
 # ----- Calling .env
-username = os.getenv("username")
-password = os.getenv("password")
-secret = os.getenv("secret")
+username = os.getenv("NET_USERNAME")
+password = os.getenv("NET_PASSWORD")
+secret = os.getenv("NET_SECRET")
 
 # Load device IPs from Excel
 INPUT_FILE = Path(__file__).resolve().parents[1] / "database" / "WriteMem.xlsx"
