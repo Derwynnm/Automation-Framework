@@ -1,4 +1,4 @@
-import pandas as pd
+import openpyxl
 from netmiko import ConnectHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
@@ -32,8 +32,8 @@ logging.basicConfig(
 
 # Worker function – runs in its own thread
 
-def configure_port_description(switch_ip: str, port_desc_pairs: list[tuple[str, str]]) -> str:
-    """Connects to a Cisco IOS device, applies descriptions to all interfaces in one session, and returns a short status string."""
+def configure_port_description(switch_ip: str, port_desc_pairs: list[tuple[str, str, bool]]) -> str:
+    """Connects to a Cisco IOS device, applies descriptions/shutdowns to all interfaces in one session, and returns a short status string."""
 
     device = {
         "device_type": "cisco_ios",
@@ -51,12 +51,15 @@ def configure_port_description(switch_ip: str, port_desc_pairs: list[tuple[str, 
 
             cmds = []
             skipped = []
-            for port, description in port_desc_pairs:
+            for port, description, shutdown in port_desc_pairs:
                 if port.lower().startswith(('po', 'twe')):
                     skipped.append(port)
                     logging.info(f"Skipped {port} on {switch_ip} (Port-Channel or Twe)")
                     continue
-                if description:
+                if shutdown:
+                    cmds.extend([f"interface {port}", "shutdown"])
+                    logging.info(f"Shutting down {port} on {switch_ip} (red cell)")
+                elif description:
                     cmds.extend([f"interface {port}", f"description {description}"])
                 else:
                     cmds.extend([f"interface {port}", "no description"])
@@ -80,24 +83,48 @@ def configure_port_description(switch_ip: str, port_desc_pairs: list[tuple[str, 
 
 # Helpers
 
-def read_excel(file_path: str) -> pd.DataFrame:
-    """Load Excel sheet containing columns 'IP Address', 'Port', 'Description'."""
-    return pd.read_excel(file_path)
+def _is_red_cell(cell) -> bool:
+    """Return True if the cell has a solid red background fill."""
+    fill = cell.fill
+    if fill.fill_type != "solid":
+        return False
+    rgb = fill.fgColor.rgb.upper()  # ARGB string e.g. 'FFFF0000'
+    return rgb.endswith("FF0000")
+
+def read_excel(file_path) -> list[dict]:
+    """Load Excel sheet and return rows with red-cell detection on the Description column."""
+    wb = openpyxl.load_workbook(file_path)
+    ws = wb.active
+
+    headers = {cell.value: cell.column - 1 for cell in ws[1] if cell.value}
+
+    rows = []
+    for row in ws.iter_rows(min_row=2):
+        ip = row[headers["IP Address"]].value
+        port = row[headers["Port"]].value
+        desc_cell = row[headers["Description"]]
+        desc = "" if desc_cell.value is None else str(desc_cell.value).strip()
+        shutdown = _is_red_cell(desc_cell)
+        if ip and port:
+            rows.append({"IP Address": str(ip).strip(), "Port": str(port).strip(),
+                         "Description": desc, "Shutdown": shutdown})
+    return rows
 
 # Main execution
 
 def main() -> None:
-    df = read_excel(FILE_PATH)
+    rows = read_excel(FILE_PATH)
 
-    # Group all (port, description) pairs by IP so each device gets exactly one SSH connection
-    ip_jobs: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    for _, row in df.iterrows():
-        ip = str(row["IP Address"]).strip()
-        desc = "" if pd.isna(row["Description"]) else str(row["Description"]).strip()
-        for port in str(row["Port"]).split(","):
+    # Group all (port, description, shutdown) triples by IP so each device gets exactly one SSH connection
+    ip_jobs: dict[str, list[tuple[str, str, bool]]] = defaultdict(list)
+    for row in rows:
+        ip = row["IP Address"]
+        desc = row["Description"]
+        shutdown = row["Shutdown"]
+        for port in row["Port"].split(","):
             port = port.strip()
             if port:
-                ip_jobs[ip].append((port, desc))
+                ip_jobs[ip].append((port, desc, shutdown))
 
     with ThreadPoolExecutor(max_workers=min(THREADS, len(ip_jobs))) as pool:
         futures = {pool.submit(configure_port_description, ip, pairs): ip
