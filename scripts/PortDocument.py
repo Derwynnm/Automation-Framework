@@ -98,6 +98,10 @@ def read_excel(file_path) -> list[dict]:
 
     headers = {cell.value: cell.column - 1 for cell in ws[1] if cell.value}
 
+    def _cell_str(row, key):
+        val = row[headers[key]].value if key in headers else None
+        return "" if val is None else str(val).strip()
+
     rows = []
     for row in ws.iter_rows(min_row=2):
         ip = row[headers["IP Address"]].value
@@ -106,8 +110,14 @@ def read_excel(file_path) -> list[dict]:
         desc = "" if desc_cell.value is None else str(desc_cell.value).strip()
         shutdown = _is_red_cell(desc_cell)
         if ip and port:
-            rows.append({"IP Address": str(ip).strip(), "Port": str(port).strip(),
-                         "Description": desc, "Shutdown": shutdown})
+            rows.append({
+                "IP Address": str(ip).strip(),
+                "Port": str(port).strip(),
+                "Description": desc,
+                "Patch": _cell_str(row, "Patch"),
+                "Logical Patch": _cell_str(row, "Logical Patch"),
+                "Shutdown": shutdown,
+            })
     return rows
 
 # Main execution
@@ -121,6 +131,10 @@ def main() -> None:
         ip = row["IP Address"]
         desc = row["Description"]
         shutdown = row["Shutdown"]
+        if desc:
+            patch = row["Logical Patch"] or row["Patch"]
+            if patch:
+                desc = f"{desc} ({patch})"
         for port in row["Port"].split(","):
             port = port.strip()
             if port:
