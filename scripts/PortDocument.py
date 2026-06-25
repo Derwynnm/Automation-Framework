@@ -57,7 +57,7 @@ def configure_port_description(switch_ip: str, port_desc_pairs: list[tuple[str, 
                     logging.info(f"Skipped {port} on {switch_ip} (Port-Channel or Twe)")
                     continue
                 if shutdown:
-                    cmds.extend([f"interface {port}", "shutdown"])
+                    cmds.extend([f"interface {port}", "no description", "shutdown"])
                     logging.info(f"Shutting down {port} on {switch_ip} (red cell)")
                 elif description:
                     cmds.extend([f"interface {port}", f"description {description}"])
