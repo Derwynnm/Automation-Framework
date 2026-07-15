@@ -78,6 +78,14 @@ def normalize_line(line: str) -> str:
     return re.sub(r"\s+", " ", line.strip())
 
 
+def is_dot_one(ip: str) -> bool:
+    """True if the IP's last octet is 1 -- the primary/core switch per site.
+    Only these devices are expected to carry a consistent ACL config, so the
+    ACL baseline/deviation comparison is scoped to them."""
+    parts = ip.strip().split(".")
+    return len(parts) == 4 and parts[-1] == "1"
+
+
 def parse_acl_section(output: str) -> List[Tuple[str, str]]:
     """Return (acl_name, normalized_ace_line) pairs from an ACL running-config section."""
     pairs: List[Tuple[str, str]] = []
@@ -262,7 +270,12 @@ def main() -> None:
     ok_results = [r for r in results if r["status"] == "ok"]
     error_results = [r for r in results if r["status"] == "error"]
 
-    acl_baseline, acl_deviations = build_baseline_and_deviations(ok_results, "acl_lines")
+    # ACLs are only expected to be consistent on the primary/core switch per
+    # site (IP ending in .1) -- edge/site switches are excluded from this
+    # comparison entirely so they don't get flagged as deviations.
+    acl_scope_results = [r for r in ok_results if is_dot_one(r["ip"])]
+
+    acl_baseline, acl_deviations = build_baseline_and_deviations(acl_scope_results, "acl_lines")
     snmp_baseline, snmp_deviations = build_baseline_and_deviations(ok_results, "snmp_lines")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -274,8 +287,10 @@ def main() -> None:
         "Devices In Scope": len(devices),
         "Devices Audited OK": len(ok_results),
         "Devices Errored": len(error_results),
+        "ACL Comparison Scope (.1 devices only)": len(acl_scope_results),
         "ACL Baseline Lines": len(acl_baseline),
         "ACL Deviation Rows": len(acl_deviations),
+        "SNMP Comparison Scope (all devices)": len(ok_results),
         "SNMP Baseline Lines": len(snmp_baseline),
         "SNMP Deviation Rows": len(snmp_deviations),
     }])
@@ -305,6 +320,7 @@ def main() -> None:
 
     print("\n=== Summary ===")
     print(f"Devices audited OK: {len(ok_results)} / {len(devices)}")
+    print(f"ACL comparison scope (.1 devices): {len(acl_scope_results)}")
     print(f"ACL baseline lines: {len(acl_baseline)}  |  ACL deviation rows: {len(acl_deviations)}")
     print(f"SNMP baseline lines: {len(snmp_baseline)}  |  SNMP deviation rows: {len(snmp_deviations)}")
     print(f"Report written: {out_path}")

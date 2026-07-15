@@ -19,12 +19,13 @@ secret = os.getenv("NET_SECRET")
 
 # ---------------- Config ----------------
 EXCEL_PATH = Path(__file__).resolve().parents[1] / "database" / "MACTest.xlsx"
-TARGET_VLAN = 1          # global target VLAN; can be per-row if you add a column
+TARGET_VLAN = 254          # global target VLAN; can be per-row if you add a column
 DRY_RUN = True
 LOG_FILE = Path(__file__).resolve().parents[1] / "logs" / "deploy_vlan_changes.log"
 REPORT_CSV = Path(__file__).resolve().parents[1] / "docs" / "deploy_vlan_report.csv"
 
 # Feature flags / behavior switches
+PORT_DESCRIPTION = "BenQ Panel"       # description applied to changed ports
 ALLOW_MULTI_MAC = False              # allow phone+PC edges (default: False)
 CONFIRM_MAC_BEFORE_CHANGE = True     # verify MAC still on same iface before change
 FORCE_MODE_ACCESS = True             # enforce 'switchport mode access' when changing VLAN
@@ -81,6 +82,17 @@ def count_dynamic_macs_on_iface(conn, iface: str) -> int:
         out, re.IGNORECASE | re.MULTILINE
     ))
 
+ARP_ENTRY = re.compile(
+    r'^Internet\s+\S+\s+\S+\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+ARPA',
+    re.IGNORECASE | re.MULTILINE
+)
+
+def arp_lookup_mac(conn, ip: str) -> str:
+    """Query the ARP table on a core/router connection for an IP; return normalized MAC or '' if unresolved."""
+    out = conn.send_command(f"show ip arp {ip}")
+    m = ARP_ENTRY.search(out)
+    return norm_mac(m.group(1)) if m else ''
+
 def ensure_vlan(conn, vlan: int):
     cmds = [f"vlan {vlan}", "exit"]
     if not DRY_RUN:
@@ -90,7 +102,7 @@ def set_access_vlan(conn, iface: str, vlan: int):
     cmds = [f"interface {iface}"]
     if FORCE_MODE_ACCESS:
         cmds.append("switchport mode access")
-    cmds.extend([f"switchport access vlan {vlan}", "exit"])
+    cmds.extend([f"switchport access vlan {vlan}", f"description {PORT_DESCRIPTION}", "exit"])
     if not DRY_RUN:
         conn.send_config_set(cmds, cmd_verify=False)
 
@@ -112,10 +124,25 @@ df = pd.read_excel(EXCEL_PATH, dtype=str)
 
 mac_series = df.get('MAC Address', pd.Series(dtype=str)).dropna()
 switch_series = df.get('IP Address', pd.Series(dtype=str)).dropna()
+device_ip_series = df.get('Device IP', pd.Series(dtype=str))
+arp_source_series = df.get('ARP Source', pd.Series(dtype=str))
 
 # Normalize and dedup
 target_macs = {norm_mac(m) for m in mac_series if norm_mac(m)}
 switch_ips = sorted({ip.strip() for ip in switch_series if ip and ip.strip()})
+
+# Row-paired MAC -> (Device IP, ARP Source), used for the ARP fallback when a MAC isn't found on any switch.
+# ARP Source is per-row since each campus has its own .1 to query.
+mac_to_device_ip = {}
+mac_to_arp_source = {}
+for mac_raw, dip, arp_src in zip(df.get('MAC Address', pd.Series(dtype=str)), device_ip_series, arp_source_series):
+    nm = norm_mac(mac_raw) if pd.notna(mac_raw) else ''
+    if not nm:
+        continue
+    if pd.notna(dip) and str(dip).strip():
+        mac_to_device_ip[nm] = str(dip).strip()
+    if pd.notna(arp_src) and str(arp_src).strip():
+        mac_to_arp_source[nm] = str(arp_src).strip()
 
 if not target_macs:
     raise SystemExit('No valid MAC addresses loaded from Excel.')
@@ -243,6 +270,51 @@ with ThreadPoolExecutor(max_workers=max_workers) as pool:
         rows = fut.result()
         if rows:
             report_rows.extend(rows)
+
+# -------------- ARP fallback for MACs still unresolved --------------
+if target_macs:
+    # Group remaining MACs by their per-row ARP Source (each campus has its own .1)
+    macs_by_source = {}
+    for mac in sorted(target_macs):
+        arp_source = mac_to_arp_source.get(mac)
+        if arp_source:
+            macs_by_source.setdefault(arp_source, []).append(mac)
+
+    resolved_pairs = []  # (original_mac, resolved_mac, device_ip)
+    for arp_source, macs in macs_by_source.items():
+        print(f"\n{len(macs)} MAC(s) not yet located; checking ARP via {arp_source}…")
+        try:
+            with ConnectHandler(device_type='cisco_ios', ip=arp_source,
+                                username=username, password=password, secret=secret,
+                                fast_cli=FAST_CLI) as arp_conn:
+                arp_conn.enable()
+                for mac in macs:
+                    device_ip = mac_to_device_ip.get(mac)
+                    if not device_ip:
+                        continue
+                    resolved = arp_lookup_mac(arp_conn, device_ip)
+                    if resolved:
+                        resolved_pairs.append((mac, resolved, device_ip))
+        except Exception as e:
+            logging.exception(f"ARP lookup via {arp_source} failed: {e}")
+            print(f"ERROR during ARP fallback on {arp_source}: {e}")
+
+    if resolved_pairs:
+        for original_mac, resolved_mac, device_ip in resolved_pairs:
+            if resolved_mac != original_mac:
+                print(f"  ARP: {device_ip} -> {resolved_mac} (sheet had {original_mac})")
+                target_macs.discard(original_mac)
+                target_macs.add(resolved_mac)
+            else:
+                print(f"  ARP: {device_ip} confirms {original_mac}; re-checking switches")
+
+        print("Re-sweeping switches for ARP-resolved MACs…")
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(process_switch, ip) for ip in switch_ips]
+            for fut in as_completed(futures):
+                rows = fut.result()
+                if rows:
+                    report_rows.extend(rows)
 
 # -------------- Report output --------------
 with open(REPORT_CSV, 'w', newline='') as f:
