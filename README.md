@@ -39,6 +39,7 @@ The scripts in this repo are task-oriented and typically follow this pattern:
 - `scripts/pw_update.py`: GUI tool to bulk add/update/delete a local user on IOS/ASA devices and save configuration.
 - `scripts/CER Project.py`: Spreadsheet quality checks for CER-related fields (flags mismatches/blank values and writes a results sheet).
 - `scripts/PortDesc_Change.py`: Example one-off description refactor driven by `show int desc` parsing (intended as a starting point).
+- `scripts/ACL_SNMP_Audit.py`: Audits IP access-lists and SNMP config across every switch in `inventory/devices.csv`, threaded, and reports what's common fleet-wide vs. which specific devices deviate (Excel report in `docs/`).
 
 ## Technologies Used
 

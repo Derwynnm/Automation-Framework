@@ -189,12 +189,84 @@ def _read_sheet(ws) -> list[dict]:
 
 # Main execution
 
+def _read_sheet_mte(ws) -> list[dict]:
+    """Read a simple 3-column worksheet (MTE format): IP Address, Port, Description.
+    Headers in row 1; data starts at row 2. Blank IPs inherit from the next
+    valid-IP row below them (same back-fill direction as PortPush format).
+    Ports may be comma- or newline-separated within a single cell.
+    """
+    ip_col = port_col = desc_col = None
+    for cell in ws[1]:
+        if cell.value == "IP Address":
+            ip_col = cell.column - 1
+        elif cell.value == "Port":
+            port_col = cell.column - 1
+        elif cell.value == "Description":
+            desc_col = cell.column - 1
+
+    if None in (ip_col, port_col, desc_col):
+        return []
+
+    raw = []
+    for row in ws.iter_rows(min_row=2):
+        port_val = row[port_col].value
+        if not port_val:
+            continue
+        ip_val = row[ip_col].value
+        ip_str = str(ip_val).strip() if ip_val else ""
+        ip = ip_str if _is_valid_ip(ip_str) else None
+        raw.append([ip, row])
+
+    next_ip = None
+    for entry in reversed(raw):
+        if entry[0] is not None:
+            next_ip = entry[0]
+        else:
+            entry[0] = next_ip
+
+    rows = []
+    for ip, row in raw:
+        if not ip:
+            continue
+        desc_cell = row[desc_col]
+        desc = "" if desc_cell.value is None else str(desc_cell.value).strip()
+        port_raw = str(row[port_col].value).strip().replace("\n", ",")
+        rows.append({
+            "IP Address": ip,
+            "Port": port_raw,
+            "Patch": "",
+            "Logical Patch": "",
+            "Device": "",
+            "Description": desc,
+            "Shutdown": _is_red_cell(desc_cell),
+        })
+
+    return rows
+
+
+def _detect_format(ws) -> str:
+    """Return 'mte' if headers are in row 1 with 3 columns, else 'portpush'."""
+    row1_headers = {cell.value for cell in ws[1] if cell.value}
+    if "IP Address" in row1_headers and "Description" in row1_headers and "Old Description" not in row1_headers:
+        return "mte"
+    return "portpush"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Push port descriptions to Cisco switches.")
     parser.add_argument("--sheet", default=None, help="Target a single sheet by name (default: all sheets)")
+    parser.add_argument("--file", default=None, help="Path to Excel file (default: PortPush.xlsx). Use 'MTE' to target database/MTE.xlsx.")
     args = parser.parse_args()
 
-    wb = openpyxl.load_workbook(FILE_PATH, data_only=True)
+    if args.file:
+        if args.file.upper() == "MTE":
+            file_path = Path(__file__).resolve().parents[1] / "database" / "MTE.xlsx"
+        else:
+            file_path = Path(args.file)
+    else:
+        file_path = FILE_PATH
+
+    wb = openpyxl.load_workbook(file_path, data_only=True)
     sheets = [ws for ws in wb.worksheets if args.sheet is None or ws.title == args.sheet]
 
     if args.sheet and not sheets:
@@ -204,7 +276,8 @@ def main() -> None:
     for ws in sheets:
         print(f"\n--- {ws.title} ---")
 
-        rows = _read_sheet(ws)
+        fmt = _detect_format(ws)
+        rows = _read_sheet_mte(ws) if fmt == "mte" else _read_sheet(ws)
 
         # Group by (ip, stack_member) — each stack member gets its own SSH session
         ip_jobs: dict[tuple[str, str], list[tuple[str, str, bool]]] = defaultdict(list)
