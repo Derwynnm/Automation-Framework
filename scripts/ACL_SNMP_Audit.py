@@ -46,6 +46,13 @@ CONN_TIMEOUT_SECS = 20
 RETRIES = 2                 # attempts per device on timeout
 BACKOFF_SEC = 2
 
+# A line only counts as strict "Baseline" if 100% of in-scope devices have it
+# verbatim -- a single non-conforming device removes it. SUGGESTED_BASELINE_THRESHOLD
+# is a lower bar (e.g. 0.90 = present on at least 90% of devices) used to build a
+# "golden template" candidate list even when a few outliers keep the strict
+# baseline from reflecting reality.
+SUGGESTED_BASELINE_THRESHOLD = 0.90
+
 ACL_COMMAND = "show running-config | section ^ip access-list"
 SNMP_COMMAND = "show running-config | section ^snmp-server"
 # ========================== END USER CONFIG =================================
@@ -184,13 +191,17 @@ def audit_device(ip: str, name: str) -> dict:
 
 def build_baseline_and_deviations(
     ok_results: List[dict], line_key: str
-) -> Tuple[List[Tuple[str, str]], List[dict]]:
+) -> Tuple[List[Tuple[str, str]], List[dict], List[dict]]:
     """
     line_key: "acl_lines" or "snmp_lines"
-    Returns (baseline_rows, deviation_rows).
-    baseline_rows: list of (section, line)
+    Returns (baseline_rows, deviation_rows, suggested_rows).
+    baseline_rows: list of (section, line) present on 100% of in-scope devices.
     deviation_rows: list of dicts with Section, Line, Type, Device_IP, Device_Name,
-                    Present_Count, Total_Count
+                    Present_Count, Total_Count -- every line that isn't on 100%.
+    suggested_rows: list of dicts with Section, Line, Present_Count, Total_Count,
+                    Percent for every line at or above SUGGESTED_BASELINE_THRESHOLD
+                    (includes the 100% baseline lines too) -- a "golden template"
+                    candidate list that isn't wiped out by one or two outlier devices.
     """
     total = len(ok_results)
     device_by_ip = {r["ip"]: r["name"] for r in ok_results}
@@ -206,9 +217,21 @@ def build_baseline_and_deviations(
 
     baseline_rows: List[Tuple[str, str]] = []
     deviation_rows: List[dict] = []
+    suggested_rows: List[dict] = []
 
     for (section, line), present_ips in key_to_devices.items():
         present_count = len(present_ips)
+        pct = (present_count / total) if total > 0 else 0.0
+
+        if pct >= SUGGESTED_BASELINE_THRESHOLD:
+            suggested_rows.append({
+                "Section": section,
+                "Line": line,
+                "Present_Count": present_count,
+                "Total_Count": total,
+                "Percent": round(pct * 100, 1),
+            })
+
         if total > 0 and present_count == total:
             baseline_rows.append((section, line))
             continue
@@ -233,7 +256,8 @@ def build_baseline_and_deviations(
 
     baseline_rows.sort()
     deviation_rows.sort(key=lambda d: (d["Section"], d["Line"], d["Device_IP"]))
-    return baseline_rows, deviation_rows
+    suggested_rows.sort(key=lambda d: (-d["Percent"], d["Section"], d["Line"]))
+    return baseline_rows, deviation_rows, suggested_rows
 
 
 def main() -> None:
@@ -270,13 +294,16 @@ def main() -> None:
     ok_results = [r for r in results if r["status"] == "ok"]
     error_results = [r for r in results if r["status"] == "error"]
 
-    # ACLs are only expected to be consistent on the primary/core switch per
-    # site (IP ending in .1) -- edge/site switches are excluded from this
-    # comparison entirely so they don't get flagged as deviations.
-    acl_scope_results = [r for r in ok_results if is_dot_one(r["ip"])]
+    # ACLs are compared in two independent groups: the core/L3 switch per
+    # site (IP ending in .1) against each other, and every other (L2/edge)
+    # switch against each other -- the two groups aren't expected to match
+    # each other, only to be internally consistent.
+    l3_results = [r for r in ok_results if is_dot_one(r["ip"])]
+    l2_results = [r for r in ok_results if not is_dot_one(r["ip"])]
 
-    acl_baseline, acl_deviations = build_baseline_and_deviations(acl_scope_results, "acl_lines")
-    snmp_baseline, snmp_deviations = build_baseline_and_deviations(ok_results, "snmp_lines")
+    l3_acl_baseline, l3_acl_deviations, l3_acl_suggested = build_baseline_and_deviations(l3_results, "acl_lines")
+    l2_acl_baseline, l2_acl_deviations, l2_acl_suggested = build_baseline_and_deviations(l2_results, "acl_lines")
+    snmp_baseline, snmp_deviations, snmp_suggested = build_baseline_and_deviations(ok_results, "snmp_lines")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     DOCS_DIR.mkdir(parents=True, exist_ok=True)
@@ -287,24 +314,31 @@ def main() -> None:
         "Devices In Scope": len(devices),
         "Devices Audited OK": len(ok_results),
         "Devices Errored": len(error_results),
-        "ACL Comparison Scope (.1 devices only)": len(acl_scope_results),
-        "ACL Baseline Lines": len(acl_baseline),
-        "ACL Deviation Rows": len(acl_deviations),
+        "L3 ACL Scope (.1 devices)": len(l3_results),
+        "L3 ACL Baseline Lines": len(l3_acl_baseline),
+        "L3 ACL Deviation Rows": len(l3_acl_deviations),
+        f"L3 ACL Suggested Baseline (>={int(SUGGESTED_BASELINE_THRESHOLD * 100)}%)": len(l3_acl_suggested),
+        "L2 ACL Scope (non-.1 devices)": len(l2_results),
+        "L2 ACL Baseline Lines": len(l2_acl_baseline),
+        "L2 ACL Deviation Rows": len(l2_acl_deviations),
+        f"L2 ACL Suggested Baseline (>={int(SUGGESTED_BASELINE_THRESHOLD * 100)}%)": len(l2_acl_suggested),
         "SNMP Comparison Scope (all devices)": len(ok_results),
         "SNMP Baseline Lines": len(snmp_baseline),
         "SNMP Deviation Rows": len(snmp_deviations),
+        f"SNMP Suggested Baseline (>={int(SUGGESTED_BASELINE_THRESHOLD * 100)}%)": len(snmp_suggested),
     }])
 
-    acl_baseline_df = pd.DataFrame(acl_baseline, columns=["Section", "Line"])
-    acl_deviations_df = pd.DataFrame(
-        acl_deviations,
-        columns=["Section", "Line", "Type", "Device_IP", "Device_Name", "Present_Count", "Total_Count"],
-    )
+    acl_dev_cols = ["Section", "Line", "Type", "Device_IP", "Device_Name", "Present_Count", "Total_Count"]
+    suggested_cols = ["Section", "Line", "Present_Count", "Total_Count", "Percent"]
+    l3_acl_baseline_df = pd.DataFrame(l3_acl_baseline, columns=["Section", "Line"])
+    l3_acl_deviations_df = pd.DataFrame(l3_acl_deviations, columns=acl_dev_cols)
+    l3_acl_suggested_df = pd.DataFrame(l3_acl_suggested, columns=suggested_cols)
+    l2_acl_baseline_df = pd.DataFrame(l2_acl_baseline, columns=["Section", "Line"])
+    l2_acl_deviations_df = pd.DataFrame(l2_acl_deviations, columns=acl_dev_cols)
+    l2_acl_suggested_df = pd.DataFrame(l2_acl_suggested, columns=suggested_cols)
     snmp_baseline_df = pd.DataFrame([line for _, line in snmp_baseline], columns=["Line"])
-    snmp_deviations_df = pd.DataFrame(
-        snmp_deviations,
-        columns=["Section", "Line", "Type", "Device_IP", "Device_Name", "Present_Count", "Total_Count"],
-    )
+    snmp_deviations_df = pd.DataFrame(snmp_deviations, columns=acl_dev_cols)
+    snmp_suggested_df = pd.DataFrame(snmp_suggested, columns=suggested_cols)
     errors_df = pd.DataFrame(
         [{"Device_IP": r["ip"], "Device_Name": r["name"], "Error": r["error"]} for r in error_results],
         columns=["Device_IP", "Device_Name", "Error"],
@@ -312,17 +346,22 @@ def main() -> None:
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         summary_df.to_excel(writer, sheet_name="Summary", index=False)
-        acl_baseline_df.to_excel(writer, sheet_name="ACL_Baseline", index=False)
-        acl_deviations_df.to_excel(writer, sheet_name="ACL_Deviations", index=False)
+        l3_acl_baseline_df.to_excel(writer, sheet_name="L3_ACL_Baseline", index=False)
+        l3_acl_suggested_df.to_excel(writer, sheet_name="L3_ACL_Suggested_Baseline", index=False)
+        l3_acl_deviations_df.to_excel(writer, sheet_name="L3_ACL_Deviations", index=False)
+        l2_acl_baseline_df.to_excel(writer, sheet_name="L2_ACL_Baseline", index=False)
+        l2_acl_suggested_df.to_excel(writer, sheet_name="L2_ACL_Suggested_Baseline", index=False)
+        l2_acl_deviations_df.to_excel(writer, sheet_name="L2_ACL_Deviations", index=False)
         snmp_baseline_df.to_excel(writer, sheet_name="SNMP_Baseline", index=False)
+        snmp_suggested_df.to_excel(writer, sheet_name="SNMP_Suggested_Baseline", index=False)
         snmp_deviations_df.to_excel(writer, sheet_name="SNMP_Deviations", index=False)
         errors_df.to_excel(writer, sheet_name="Errors", index=False)
 
     print("\n=== Summary ===")
     print(f"Devices audited OK: {len(ok_results)} / {len(devices)}")
-    print(f"ACL comparison scope (.1 devices): {len(acl_scope_results)}")
-    print(f"ACL baseline lines: {len(acl_baseline)}  |  ACL deviation rows: {len(acl_deviations)}")
-    print(f"SNMP baseline lines: {len(snmp_baseline)}  |  SNMP deviation rows: {len(snmp_deviations)}")
+    print(f"L3 ACL scope (.1 devices): {len(l3_results)}  |  baseline: {len(l3_acl_baseline)}  |  suggested: {len(l3_acl_suggested)}  |  deviations: {len(l3_acl_deviations)}")
+    print(f"L2 ACL scope (non-.1 devices): {len(l2_results)}  |  baseline: {len(l2_acl_baseline)}  |  suggested: {len(l2_acl_suggested)}  |  deviations: {len(l2_acl_deviations)}")
+    print(f"SNMP baseline: {len(snmp_baseline)}  |  suggested: {len(snmp_suggested)}  |  deviations: {len(snmp_deviations)}")
     print(f"Report written: {out_path}")
 
 
